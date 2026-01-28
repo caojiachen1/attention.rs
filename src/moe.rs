@@ -301,11 +301,11 @@ pub fn moe_gemm_fp8(
                 let k_blocks = (size_k + block_size_k - 1) / block_size_k;
                 let num_groups_per_row = k_blocks;
                 let num_groups = (input_rows * num_groups_per_row) as i32;
-                
+
                 // SM100+ (Blackwell) requires column-major scale layout (UMMA::Major::MN)
                 // SM90 (Hopper) requires row-major scale layout (GMMA::Major::K)
                 let is_column_major_scales = sm_version >= 100;
-                
+
                 let input_q = Tensor::zeros((input_rows, size_k), DType::U8, &device)?;
                 let input_scale = if is_column_major_scales {
                     // Column-major: allocate transposed and transpose for column-major view
@@ -330,14 +330,9 @@ pub fn moe_gemm_fp8(
 
                 // Get scale stride for quantization kernel
                 let input_scale_stride = if is_column_major_scales {
-                    input_rows as i32  // Column-major stride
+                    input_rows as i32 // Column-major stride
                 } else {
-                    num_groups_per_row as i32  // Row-major stride
-                };
-                let rep_scale_stride = if is_column_major_scales {
-                    size_m as i32
-                } else {
-                    num_groups_per_row as i32
+                    num_groups_per_row as i32 // Row-major stride
                 };
 
                 let (input_q, _) = input_q.storage_and_layout();
@@ -400,7 +395,7 @@ pub fn moe_gemm_fp8(
                         map_divisor,
                         stream as i64,
                     );
-                    
+
                     // Use strided shuffle for column-major scales (SM100+ Blackwell)
                     // or regular shuffle for row-major scales (SM90)
                     if is_column_major_scales {
@@ -411,8 +406,8 @@ pub fn moe_gemm_fp8(
                             input_rows as i64,
                             size_m as i64,
                             num_groups_per_row as i64,
-                            input_rows as i64,    // src_row_stride (column-major)
-                            size_m as i64,        // dst_row_stride (column-major)
+                            input_rows as i64, // src_row_stride (column-major)
+                            size_m as i64,     // dst_row_stride (column-major)
                             map_divisor,
                             stream as i64,
                         );

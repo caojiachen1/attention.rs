@@ -26,6 +26,7 @@
 #include "cute/tensor.hpp"
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
+#endif
 
 namespace vllm_rs_moe {
 
@@ -177,6 +178,7 @@ __global__ void scatter_rows_kernel(
   }
 }
 
+#if defined(USE_CUTLASS)
 template <typename ScaleConfig, typename LayoutSFA, typename LayoutSFB, typename StrideA, typename StrideB, typename StrideC,
           typename UnderlyingProblemShape, typename OutType>
 __global__ void build_grouped_gemm_args(
@@ -525,6 +527,7 @@ struct Sm120GroupConfig {
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 };
+#endif
 
 }  // namespace vllm_rs_moe
 
@@ -736,4 +739,3 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
   printf("moe_fp8_grouped_gemm_bf16 unsupported sm_version %d\n", sm_version);
 }
 
-#endif
