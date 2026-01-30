@@ -1,4 +1,4 @@
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
 use crate::cuda_utils;
 #[cfg(feature = "cuda")]
 use crate::kernels::ffi;
@@ -8,7 +8,7 @@ use crate::metal_kernels;
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{DType, Device, Result, Tensor};
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
 fn get_cuda_slice<
     T: candle_core::cuda_backend::cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType,
 >(
