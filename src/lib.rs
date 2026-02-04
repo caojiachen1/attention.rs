@@ -21,8 +21,24 @@ pub mod cuda_utils;
 pub mod fp8_linear;
 pub mod ops;
 
+#[cfg(feature = "flashinfer")]
+pub mod flashinfer;
+
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
+pub struct FlashInferMetadata {
+    pub indptr: Tensor,
+    pub indptr_host: Vec<u32>,
+    pub indices: Tensor,
+    pub last_len: Tensor,
+    pub cu_seqlens_q_host: Option<Vec<u32>>,
+    pub total_num_rows: Option<u32>,
+    pub batch_indices: Option<Tensor>,
+    pub positions: Option<Tensor>,
+    pub use_cuda_graph: bool,
+    pub decode_plan_info: Option<Vec<i64>>,
+}
+
 pub struct InputMetadata {
     pub is_prefill: bool,
     pub slot_mapping: Tensor,
@@ -35,6 +51,7 @@ pub struct InputMetadata {
     pub max_context_len: usize,
     pub disable_flash_attn: Option<bool>,
     pub seqlens: Option<Vec<u32>>,
+    pub flashinfer_metadata: Option<FlashInferMetadata>,
 }
 
 #[allow(dead_code)]
@@ -308,6 +325,108 @@ impl PagedAttention {
             if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION {
                 kv_scale_update(key, value, k_scale, v_scale)?;
                 self.kv_updated_times.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        #[cfg(feature = "flashinfer")]
+        if input_metadata.flashinfer_metadata.is_some() {
+            let use_flashinfer = match key_cache.as_ref().map(|kc| kc.dtype()) {
+                Some(candle_core::DType::F16) | Some(candle_core::DType::BF16) => true,
+                _ => false,
+            };
+            let use_flashinfer = use_flashinfer
+                && self.sliding_window.is_none()
+                && self.alibi_slopes.is_none()
+                && softcapping.is_none();
+            if use_flashinfer {
+                if let Some(kc) = key_cache.as_ref() {
+                    if kc.dtype() != query.dtype() {
+                        candle_core::bail!(
+                            "flashinfer requires query dtype {:?} to match kv cache dtype {:?}",
+                            query.dtype(),
+                            kc.dtype()
+                        );
+                    }
+                }
+
+                let (_, attention_heads, _, head_size) = query.shape().dims4()?;
+                let (_, key_value_heads, _, _) = key.shape().dims4()?;
+                let query = query.transpose(1, 2)?.contiguous()?.reshape((
+                    (),
+                    attention_heads,
+                    head_size,
+                ))?;
+                let key =
+                    key.transpose(1, 2)?
+                        .contiguous()?
+                        .reshape(((), key_value_heads, head_size))?;
+
+                let value = value.transpose(1, 2)?.contiguous()?.reshape((
+                    (),
+                    key_value_heads,
+                    head_size,
+                ))?;
+
+                let fm = input_metadata.flashinfer_metadata.as_ref().unwrap();
+                if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
+                    crate::flashinfer::append_kv_cache(
+                        &key,
+                        &value,
+                        kc,
+                        vc,
+                        &fm.indices,
+                        &fm.indptr,
+                        &fm.last_len,
+                        fm.batch_indices.as_ref(),
+                        fm.positions.as_ref(),
+                    )?;
+                }
+
+                let block_size = if let Some(kc) = key_cache.as_ref() {
+                    kc.dim(1)?
+                } else {
+                    16
+                };
+
+                return if input_metadata.is_prefill {
+                    crate::flashinfer::prefill(
+                        &query,
+                        key_cache.as_ref().unwrap(),
+                        value_cache.as_ref().unwrap(),
+                        &fm.indices,
+                        &fm.indptr,
+                        &fm.indptr_host,
+                        &fm.last_len,
+                        input_metadata.cu_seqlens_q.as_ref().unwrap(),
+                        fm.cu_seqlens_q_host.as_ref().unwrap(),
+                        fm.total_num_rows.unwrap(),
+                        block_size,
+                        attention_heads,
+                        key_value_heads,
+                        head_size,
+                        self.scale as f32,
+                    )
+                } else {
+                    let plan_info = fm.decode_plan_info.as_ref().ok_or_else(|| {
+                        candle_core::Error::msg(
+                            "flashinfer decode requires decode_plan_info (plan+run path)",
+                        )
+                    })?;
+                    crate::flashinfer::decode_with_plan(
+                        &query,
+                        key_cache.as_ref().unwrap(),
+                        value_cache.as_ref().unwrap(),
+                        &fm.indices,
+                        &fm.indptr,
+                        &fm.last_len,
+                        block_size,
+                        attention_heads,
+                        key_value_heads,
+                        head_size,
+                        self.scale as f32,
+                        plan_info,
+                    )
+                };
             }
         }
 
