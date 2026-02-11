@@ -87,7 +87,7 @@ fn main() -> Result<()> {
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
             "https://github.com/guoqingbao/flashinfer.git",
-            "9d5495241fa6aebde4733e121d0e0734a165737f", // v0.6.2
+            "960cb902ce15ec085d42aa1bbe7026979c9a04dd", // v0.6.2
             vec!["include"],
             false,
         );
