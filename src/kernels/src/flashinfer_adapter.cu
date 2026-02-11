@@ -862,7 +862,7 @@ void flashinfer_prefill_wrapper(
                 nullptr /* mask indptr */, nullptr /* q rope offset */,
                 (DTypeOut*)out_ptr, nullptr /* lse */, nullptr /* alibi */,
                 num_qo_heads, num_qo_heads * head_dim /* q_stride_n */, head_dim /* q_stride_h */,
-                window_left > 0 ? window_left : -1 /* window */, logits_soft_cap, /* logits_cap */, sm_scale, rope_scale, rope_theta
+                window_left > 0 ? window_left : -1 /* window */, logits_soft_cap /* logits_cap */, sm_scale, rope_scale, rope_theta
             );
 
             params.request_indices = GetPtrFromBaseOffset<IdType>(workspace_int, plan_info.request_indices_offset);
