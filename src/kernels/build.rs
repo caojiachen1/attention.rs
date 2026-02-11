@@ -24,6 +24,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/fp8_matmul.cu");
     println!("cargo:rerun-if-changed=src/fp8_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/fp8_moe_cutlass.cu");
+    println!("cargo:rerun-if-changed=src/flashinfer_fp8_qquant.cu");
+    println!("cargo:rerun-if-changed=src/flashinfer_adapter_fp8.cu");
 
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
@@ -32,17 +34,21 @@ fn main() -> Result<()> {
 
     let mut builder = KernelBuilder::new()
         .source_dir("src")
+        .nvcc_thread_patterns(&["flash_api", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3");
 
-    let compute_cap = builder.get_compute_cap();
+    let compute_cap = builder.get_compute_cap().unwrap_or(80);
 
     println!("cargo:info=compute capability: {:?}", compute_cap);
 
-    if compute_cap.unwrap_or(80) < 80 {
+    if compute_cap < 80 {
         builder = builder.arg("-DNO_BF16_KERNEL");
         builder = builder.arg("-DNO_MARLIN_KERNEL");
+    }
+
+    if compute_cap < 90 {
         builder = builder.arg("-DNO_HARDWARE_FP8");
     }
 
@@ -54,18 +60,34 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_FP8_KVCACHE");
     }
 
-    if std::env::var("CARGO_FEATURE_CUTLASS").is_ok() {
+    if std::env::var("CARGO_FEATURE_CUTLASS").is_ok()
+        || std::env::var("CARGO_FEATURE_FLASHINFER").is_ok()
+    {
         builder = builder.arg("-DUSE_CUTLASS").with_cutlass(None);
+
+        if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
+            if compute_cap >= 89 {
+                builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E8M0");
+            }
+            if compute_cap == 90 {
+                builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
+                builder = builder.arg("-DSM_90_PASS");
+            }
+            if compute_cap >= 90 {
+                builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
+                builder = builder.arg("-DFLASHINFER_ENABLE_FP4_E2M1");
+            }
+        }
     }
 
     if std::env::var("CARGO_FEATURE_FLASHINFER").is_ok() {
         println!("cargo:rerun-if-changed=src/flashinfer_adapter.cu");
-        // DO not change this, this featch flashinfer v0.6.2 headers
-        // which is compatible with our code
+        // DO not change this, this featch custom flashinfer v0.6.3 headers
+        // which is compatible with our code (added more gqa group_size)
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
-            "https://github.com/flashinfer-ai/flashinfer.git",
-            "a49b45336e56e4615eae102cf29d5110293d9130", // v0.6.2
+            "https://github.com/guoqingbao/flashinfer.git",
+            "05d49ada05a8ef90c24b8e680228f57b198b3ef8", // v0.6.3
             vec!["include"],
             false,
         );

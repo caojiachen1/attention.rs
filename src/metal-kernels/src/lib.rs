@@ -748,6 +748,8 @@ pub fn paged_attention_v2(
 /// * `seq_lens` - A buffer containing the full context length of each sequence.
 /// * `query_start_len` - A buffer indicating the start token index for each sequence in the flattened query tensor.
 /// * `alibi_slopes` - Optional buffer containing ALiBi slopes for positional bias.
+/// * `k_scale` - Optional buffer for per-head FP8 K scales.
+/// * `v_scale` - Optional buffer for per-head FP8 V scales.
 /// * `sinks` - Optional buffer for sink attention.
 /// * `num_kv_heads` - The number of key-value heads (for Grouped-Query Attention).
 /// * `scale` - The softmax scaling factor (typically `1.0 / sqrt(head_size)`).
@@ -784,6 +786,8 @@ pub fn paged_attention_prefill(
     query_start_len: &Buffer,
     query_start_len_offset: usize,
     alibi_slopes: Option<(MetalStorage, usize)>,
+    k_scale: Option<MetalStorage>,
+    v_scale: Option<MetalStorage>,
     sinks: Option<(MetalStorage, usize)>,
     // Scalar Parameters
     num_kv_heads: i32,
@@ -803,6 +807,7 @@ pub fn paged_attention_prefill(
 ) -> Result<(), MetalKernelError> {
     // This value must match the `token_chunk_size` used in the .metal instantiation macros
     const TOKEN_CHUNK_SIZE: u64 = 64;
+    let quantized_cache = k_scale.is_some() && v_scale.is_some();
 
     // 1. Construct the unique kernel name from its template parameters.
     let type_name = match ty {
@@ -810,10 +815,17 @@ pub fn paged_attention_prefill(
         PagedAttentionDType::BF16 => "bfloat16_t",
         PagedAttentionDType::F16 => "half",
     };
-    let name = format!(
-        "chunked_prefill_{}_hs{}_bs{}_tcs{}",
-        type_name, head_size, block_size, TOKEN_CHUNK_SIZE
-    );
+    let name = if quantized_cache {
+        format!(
+            "chunked_prefill_{}_uint8_t_hs{}_bs{}_tcs{}",
+            type_name, head_size, block_size, TOKEN_CHUNK_SIZE
+        )
+    } else {
+        format!(
+            "chunked_prefill_{}_hs{}_bs{}_tcs{}",
+            type_name, head_size, block_size, TOKEN_CHUNK_SIZE
+        )
+    };
 
     // 2. Load the pipeline. The prefill kernel does not use function constants.
     let pipeline = kernels.load_pipeline(device, name)?;
@@ -876,18 +888,12 @@ pub fn paged_attention_prefill(
     if let Some((slop, offset)) = alibi_slopes {
         encoder.set_buffer(15, Some(slop.buffer()), offset as NSUInteger);
     }
-    // Set unused k_scale and v_scale for signature compatibility
-    let dummy_scale = 1.0f32;
-    encoder.set_bytes(
-        16,
-        size_of_val(&dummy_scale),
-        &dummy_scale as *const _ as *const c_void,
-    );
-    encoder.set_bytes(
-        17,
-        size_of_val(&dummy_scale),
-        &dummy_scale as *const _ as *const c_void,
-    );
+    if let Some(k_scale) = k_scale {
+        encoder.set_buffer(16, Some(k_scale.buffer()), 0);
+    }
+    if let Some(v_scale) = v_scale {
+        encoder.set_buffer(17, Some(v_scale.buffer()), 0);
+    }
     if let Some((sk, offset)) = sinks {
         encoder.set_buffer(18, Some(sk.buffer()), offset as NSUInteger);
     }
@@ -994,21 +1000,24 @@ pub fn call_causal_mask(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn call_update_scales(
+#[allow(clippy::too_many_arguments)]
+pub fn call_update_scales_per_head(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
     ty: PagedAttentionDType,
     k: &Buffer,
     v: &Buffer,
-    num_elements: i64,
+    num_tokens: i64,
+    num_heads: i32,
+    head_dim: i32,
     k_scales: &Buffer,
     v_scales: &Buffer,
 ) -> Result<(), MetalKernelError> {
     let name = match ty {
-        PagedAttentionDType::F32 => "compute_and_update_scales_float",
-        PagedAttentionDType::BF16 => "compute_and_update_scales_bfloat16_t",
-        PagedAttentionDType::F16 => "compute_and_update_scales_half",
+        PagedAttentionDType::F32 => "compute_and_update_scales_per_head_float",
+        PagedAttentionDType::BF16 => "compute_and_update_scales_per_head_bfloat16_t",
+        PagedAttentionDType::F16 => "compute_and_update_scales_per_head_half",
     };
 
     let pipeline = kernels.load_pipeline(device, name.to_string())?;
@@ -1017,26 +1026,26 @@ pub fn call_update_scales(
     let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Set the parameters
     set_params!(
         encoder,
         (
-            (k, 0),        // k buffer
-            (v, 0),        // v buffer
-            num_elements,  // total number of elements
-            (k_scales, 0), // k scale
-            (v_scales, 0)  // v scale
+            (k, 0),
+            (v, 0),
+            num_tokens,
+            num_heads,
+            head_dim,
+            (k_scales, 0),
+            (v_scales, 0)
         )
     );
 
-    // Dispatch the kernel
-    let thread_groups_count = MTLSize {
-        width: (num_elements as u64 + 511) / 512,
+    let threads_per_threadgroup = MTLSize {
+        width: 256,
         height: 1,
         depth: 1,
     };
-    let threads_per_threadgroup = MTLSize {
-        width: 512,
+    let thread_groups_count = MTLSize {
+        width: 1,
         height: 1,
         depth: 1,
     };
