@@ -304,6 +304,17 @@ impl MambaCache {
                 self.max_batch_size
             ))
         })?;
+        // Defensive reset on allocation so reused slots can never carry stale
+        // state even if prior cleanup failed silently.
+        if let Err(err) = self.reset_slot_states(slot) {
+            self.free_slots.push(slot);
+            candle_core::bail!(
+                "MambaCache: failed to reset slot {} before allocation for sequence {}: {}",
+                slot,
+                seq_id,
+                err
+            );
+        }
         self.seq_to_slot.insert(seq_id, slot);
         Ok(slot)
     }
@@ -393,7 +404,16 @@ impl MambaCache {
     pub fn free_slot(&mut self, seq_id: usize) {
         if let Some(slot) = self.seq_to_slot.remove(&seq_id) {
             // Zero out the state for this slot
-            let _ = self.reset_slot_states(slot);
+            if let Err(err) = self.reset_slot_states(slot) {
+                tracing::error!(
+                    "MambaCache: failed to reset slot {} for finished sequence {}: {}",
+                    slot,
+                    seq_id,
+                    err
+                );
+                // Keep the slot out of free-list if reset fails to avoid stale-state reuse.
+                return;
+            }
             self.free_slots.push(slot);
         }
     }
@@ -622,9 +642,7 @@ impl MambaCache {
             let Some(hash) = self.prefix_lru.pop_front() else {
                 break;
             };
-            if self.prefix_states.remove(&hash).is_some() {
-                break;
-            }
+            let _ = self.prefix_states.remove(&hash);
         }
     }
 
