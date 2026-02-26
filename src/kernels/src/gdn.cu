@@ -1007,9 +1007,9 @@ struct VecType<__nv_bfloat16> {
     static constexpr int size = 8;
 };
 
-template <typename T>
+template <typename T, typename ALogT>
 __device__ __forceinline__ void compute_gating(
-    T a_val, T b_val, T a_log_val, T dt_val, T& g_val, T& beta_val) {
+    T a_val, T b_val, ALogT a_log_val, T dt_val, T& g_val, T& beta_val) {
     float a_f = to_float(a_val);
     float b_f = to_float(b_val);
     float alog_f = to_float(a_log_val);
@@ -1024,9 +1024,9 @@ __device__ __forceinline__ void compute_gating(
     beta_val = from_float<T>(beta_f);
 }
 
-template <typename T>
+template <typename T, typename ALogT>
 __global__ void fused_gdn_gating_kernel(
-    const T* __restrict__ a_log,
+    const ALogT* __restrict__ a_log,
     const T* __restrict__ a,
     const T* __restrict__ b,
     const T* __restrict__ dt_bias,
@@ -1039,12 +1039,19 @@ __global__ void fused_gdn_gating_kernel(
         return;
     }
     int h_idx = idx % num_heads;
-    compute_gating(a[idx], b[idx], a_log[h_idx], dt_bias[h_idx], g[idx], beta[idx]);
+    compute_gating<T, ALogT>(
+        a[idx],
+        b[idx],
+        a_log[h_idx],
+        dt_bias[h_idx],
+        g[idx],
+        beta[idx]
+    );
 }
 
-template <typename T>
+template <typename T, typename ALogT>
 __global__ void fused_gdn_gating_kernel_vectorized(
-    const T* __restrict__ a_log,
+    const ALogT* __restrict__ a_log,
     const T* __restrict__ a,
     const T* __restrict__ b,
     const T* __restrict__ dt_bias,
@@ -1081,8 +1088,14 @@ __global__ void fused_gdn_gating_kernel_vectorized(
         int curr_idx = idx + i;
         if (curr_idx < total_elements) {
             int h_idx = curr_idx % num_heads;
-            compute_gating(a_arr[i], b_arr[i], a_log[h_idx], dt_bias[h_idx],
-                           g_arr[i], beta_arr[i]);
+            compute_gating<T, ALogT>(
+                a_arr[i],
+                b_arr[i],
+                a_log[h_idx],
+                dt_bias[h_idx],
+                g_arr[i],
+                beta_arr[i]
+            );
         }
     }
 
@@ -1090,8 +1103,8 @@ __global__ void fused_gdn_gating_kernel_vectorized(
     beta_vec_ptr[blockIdx.x * blockDim.x + threadIdx.x] = beta_vec;
 }
 
-template <typename T>
-void launch_fused_gdn_gating(const T* al, const T* a, const T* b, const T* dt,
+template <typename T, typename ALogT>
+void launch_fused_gdn_gating(const ALogT* al, const T* a, const T* b, const T* dt,
                              T* g, T* beta, int bat, int seq, int h,
                              cudaStream_t stream) {
     int total = bat * seq * h;
@@ -1111,11 +1124,11 @@ void launch_fused_gdn_gating(const T* al, const T* a, const T* b, const T* dt,
     if (aligned) {
         int vec_elements = total / VecSize;
         int blocks = (vec_elements + threads - 1) / threads;
-        fused_gdn_gating_kernel_vectorized<T><<<blocks, threads, 0, stream>>>(
+        fused_gdn_gating_kernel_vectorized<T, ALogT><<<blocks, threads, 0, stream>>>(
             al, a, b, dt, g, beta, total, h);
     } else {
         int blocks = (total + threads - 1) / threads;
-        fused_gdn_gating_kernel<T><<<blocks, threads, 0, stream>>>(
+        fused_gdn_gating_kernel<T, ALogT><<<blocks, threads, 0, stream>>>(
             al, a, b, dt, g, beta, total, h);
     }
     CHECK_CUDA(cudaGetLastError());
@@ -1125,14 +1138,14 @@ extern "C" void fused_gdn_gating_f32(const float* al, const float* a,
                                      const float* b, const float* dt,
                                      float* g, float* beta, int bat,
                                      int seq, int h, cudaStream_t stream) {
-    launch_fused_gdn_gating(al, a, b, dt, g, beta, bat, seq, h, stream);
+    launch_fused_gdn_gating<float, float>(al, a, b, dt, g, beta, bat, seq, h, stream);
 }
 
 extern "C" void fused_gdn_gating_f16(const half* al, const half* a,
                                      const half* b, const half* dt,
                                      half* g, half* beta, int bat,
                                      int seq, int h, cudaStream_t stream) {
-    launch_fused_gdn_gating(al, a, b, dt, g, beta, bat, seq, h, stream);
+    launch_fused_gdn_gating<half, half>(al, a, b, dt, g, beta, bat, seq, h, stream);
 }
 
 extern "C" void fused_gdn_gating_bf16(const __nv_bfloat16* al,
@@ -1143,7 +1156,37 @@ extern "C" void fused_gdn_gating_bf16(const __nv_bfloat16* al,
                                       __nv_bfloat16* beta, int bat,
                                       int seq, int h,
                                       cudaStream_t stream) {
-    launch_fused_gdn_gating(al, a, b, dt, g, beta, bat, seq, h, stream);
+    launch_fused_gdn_gating<__nv_bfloat16, __nv_bfloat16>(
+        al, a, b, dt, g, beta, bat, seq, h, stream
+    );
+}
+
+extern "C" void fused_gdn_gating_f16_alog_f32(
+    const float* al,
+    const half* a,
+    const half* b,
+    const half* dt,
+    half* g,
+    half* beta,
+    int bat,
+    int seq,
+    int h,
+    cudaStream_t stream) {
+    launch_fused_gdn_gating<half, float>(al, a, b, dt, g, beta, bat, seq, h, stream);
+}
+
+extern "C" void fused_gdn_gating_bf16_alog_f32(
+    const float* al,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    const __nv_bfloat16* dt,
+    __nv_bfloat16* g,
+    __nv_bfloat16* beta,
+    int bat,
+    int seq,
+    int h,
+    cudaStream_t stream) {
+    launch_fused_gdn_gating<__nv_bfloat16, float>(al, a, b, dt, g, beta, bat, seq, h, stream);
 }
 
 
@@ -1151,12 +1194,12 @@ extern "C" void fused_gdn_gating_bf16(const __nv_bfloat16* al,
 // Fused Gated RMSNorm + SiLU(z) + Mul
 // =============================================================================
 
-template <typename T, int THREADS>
+template <typename T, typename W, int THREADS>
 __global__ void gated_rmsnorm_silu_mul_kernel(
     const T* __restrict__ x,       // [rows, value_dim]
     const T* __restrict__ z,       // [rows, value_dim]
-    const T* __restrict__ gamma,   // [group_size] (per-head) or [value_dim] (full)
-    const T* __restrict__ bias,    // optional, same shape rule as gamma
+    const W* __restrict__ gamma,   // [group_size] (per-head) or [value_dim] (full)
+    const W* __restrict__ bias,    // optional, same shape rule as gamma
     T* __restrict__ out,           // [rows, value_dim]
     int rows,
     int value_dim,
@@ -1230,12 +1273,12 @@ __global__ void gated_rmsnorm_silu_mul_kernel(
     }
 }
 
-template <typename T>
+template <typename T, typename W>
 void launch_gated_rmsnorm_silu_mul(
     const T* x,
     const T* z,
-    const T* gamma,
-    const T* bias,
+    const W* gamma,
+    const W* bias,
     T* out,
     int rows,
     int value_dim,
@@ -1249,7 +1292,7 @@ void launch_gated_rmsnorm_silu_mul(
     const int num_groups = value_dim / group_size;
     dim3 grid(rows * num_groups);
     dim3 block(THREADS);
-    gated_rmsnorm_silu_mul_kernel<T, THREADS><<<grid, block, 0, stream>>>(
+    gated_rmsnorm_silu_mul_kernel<T, W, THREADS><<<grid, block, 0, stream>>>(
         x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias);
     CHECK_CUDA(cudaGetLastError());
 }
@@ -1267,7 +1310,7 @@ extern "C" void gdn_gated_rmsnorm_silu_mul_f32(
     bool per_group_weights,
     bool has_bias,
     cudaStream_t stream) {
-    launch_gated_rmsnorm_silu_mul(
+    launch_gated_rmsnorm_silu_mul<float, float>(
         x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
 }
 
@@ -1284,7 +1327,7 @@ extern "C" void gdn_gated_rmsnorm_silu_mul_f16(
     bool per_group_weights,
     bool has_bias,
     cudaStream_t stream) {
-    launch_gated_rmsnorm_silu_mul(
+    launch_gated_rmsnorm_silu_mul<half, half>(
         x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
 }
 
@@ -1301,7 +1344,41 @@ extern "C" void gdn_gated_rmsnorm_silu_mul_bf16(
     bool per_group_weights,
     bool has_bias,
     cudaStream_t stream) {
-    launch_gated_rmsnorm_silu_mul(
+    launch_gated_rmsnorm_silu_mul<__nv_bfloat16, __nv_bfloat16>(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
+}
+
+extern "C" void gdn_gated_rmsnorm_silu_mul_f16_wf32(
+    const half* x,
+    const half* z,
+    const float* gamma,
+    const float* bias,
+    half* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul<half, float>(
+        x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
+}
+
+extern "C" void gdn_gated_rmsnorm_silu_mul_bf16_wf32(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* z,
+    const float* gamma,
+    const float* bias,
+    __nv_bfloat16* out,
+    int rows,
+    int value_dim,
+    int group_size,
+    float eps,
+    bool per_group_weights,
+    bool has_bias,
+    cudaStream_t stream) {
+    launch_gated_rmsnorm_silu_mul<__nv_bfloat16, float>(
         x, z, gamma, bias, out, rows, value_dim, group_size, eps, per_group_weights, has_bias, stream);
 }
 

@@ -647,10 +647,10 @@ extern "C" {
     );
 
     pub fn topk_softmax(
-        gating_output: *const f32,        // in： [num_tokens, num_experts]
-        token_expert_indices: *const i32, // out: [num_tokens, topk]
-        topk_weights: *const f32,         // out: [num_tokens, topk]
-        topk_indices: *const u32,         // out: [num_tokens, topk]
+        gating_output: *const f32,      // in： [num_tokens, num_experts]
+        token_expert_indices: *mut i32, // out: [num_tokens, topk]
+        topk_weights: *mut f32,         // out: [num_tokens, topk]
+        topk_indices: *mut u32,         // out: [num_tokens, topk]
         num_experts: i32,
         num_tokens: i32,
         topk: i32,
@@ -1378,6 +1378,30 @@ extern "C" {
         h: c_int,
         s: i64,
     );
+    pub fn fused_gdn_gating_f16_alog_f32(
+        al: *const f32,
+        a: *const c_void,
+        b: *const c_void,
+        dt: *const c_void,
+        g: *mut c_void,
+        beta: *mut c_void,
+        bat: c_int,
+        seq: c_int,
+        h: c_int,
+        s: i64,
+    );
+    pub fn fused_gdn_gating_bf16_alog_f32(
+        al: *const f32,
+        a: *const c_void,
+        b: *const c_void,
+        dt: *const c_void,
+        g: *mut c_void,
+        beta: *mut c_void,
+        bat: c_int,
+        seq: c_int,
+        h: c_int,
+        s: i64,
+    );
 
     pub fn gdn_gated_rmsnorm_silu_mul_f32(
         x: *const f32,
@@ -1412,6 +1436,34 @@ extern "C" {
         z: *const c_void,
         gamma: *const c_void,
         bias: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_silu_mul_f16_wf32(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const f32,
+        bias: *const f32,
+        out: *mut c_void,
+        rows: c_int,
+        value_dim: c_int,
+        group_size: c_int,
+        eps: f32,
+        per_group_weights: bool,
+        has_bias: bool,
+        s: i64,
+    );
+    pub fn gdn_gated_rmsnorm_silu_mul_bf16_wf32(
+        x: *const c_void,
+        z: *const c_void,
+        gamma: *const f32,
+        bias: *const f32,
         out: *mut c_void,
         rows: c_int,
         value_dim: c_int,

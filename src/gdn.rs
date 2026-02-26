@@ -395,30 +395,64 @@ pub fn fused_gdn_gating(
 
             unsafe {
                 match a.dtype() {
-                    DType::F16 => ffi::fused_gdn_gating_f16(
-                        al_ptr,
-                        a_ptr,
-                        b_ptr,
-                        dt_ptr,
-                        g_ptr,
-                        beta_ptr,
-                        batch as c_int,
-                        seq_len as c_int,
-                        heads as c_int,
-                        stream,
-                    ),
-                    DType::BF16 => ffi::fused_gdn_gating_bf16(
-                        al_ptr,
-                        a_ptr,
-                        b_ptr,
-                        dt_ptr,
-                        g_ptr,
-                        beta_ptr,
-                        batch as c_int,
-                        seq_len as c_int,
-                        heads as c_int,
-                        stream,
-                    ),
+                    DType::F16 => {
+                        if a_log.dtype() == DType::F32 {
+                            ffi::fused_gdn_gating_f16_alog_f32(
+                                al_ptr as *const f32,
+                                a_ptr,
+                                b_ptr,
+                                dt_ptr,
+                                g_ptr,
+                                beta_ptr,
+                                batch as c_int,
+                                seq_len as c_int,
+                                heads as c_int,
+                                stream,
+                            )
+                        } else {
+                            ffi::fused_gdn_gating_f16(
+                                al_ptr,
+                                a_ptr,
+                                b_ptr,
+                                dt_ptr,
+                                g_ptr,
+                                beta_ptr,
+                                batch as c_int,
+                                seq_len as c_int,
+                                heads as c_int,
+                                stream,
+                            )
+                        }
+                    }
+                    DType::BF16 => {
+                        if a_log.dtype() == DType::F32 {
+                            ffi::fused_gdn_gating_bf16_alog_f32(
+                                al_ptr as *const f32,
+                                a_ptr,
+                                b_ptr,
+                                dt_ptr,
+                                g_ptr,
+                                beta_ptr,
+                                batch as c_int,
+                                seq_len as c_int,
+                                heads as c_int,
+                                stream,
+                            )
+                        } else {
+                            ffi::fused_gdn_gating_bf16(
+                                al_ptr,
+                                a_ptr,
+                                b_ptr,
+                                dt_ptr,
+                                g_ptr,
+                                beta_ptr,
+                                batch as c_int,
+                                seq_len as c_int,
+                                heads as c_int,
+                                stream,
+                            )
+                        }
+                    }
                     DType::F32 => ffi::fused_gdn_gating_f32(
                         al_ptr as *const f32,
                         a_ptr as *const f32,
@@ -480,12 +514,7 @@ pub fn gated_rmsnorm_silu_mul(
                 );
             }
 
-            let weight = if norm_weight.dtype() == x.dtype() {
-                norm_weight.contiguous()?
-            } else {
-                norm_weight.to_dtype(x.dtype())?.contiguous()?
-            };
-            let weight_len = weight.dim(0)?;
+            let weight_len = norm_weight.dim(0)?;
             let per_group_weights = if weight_len == group_size {
                 true
             } else if weight_len == value_dim {
@@ -498,11 +527,6 @@ pub fn gated_rmsnorm_silu_mul(
             };
 
             let bias = if let Some(b) = norm_bias {
-                let b = if b.dtype() == x.dtype() {
-                    b.contiguous()?
-                } else {
-                    b.to_dtype(x.dtype())?.contiguous()?
-                };
                 let b_len = b.dim(0)?;
                 let expected = if per_group_weights {
                     group_size
@@ -523,7 +547,7 @@ pub fn gated_rmsnorm_silu_mul(
 
             let x_ptr = get_cuda_const_ptr(&x_c)?;
             let z_ptr = get_cuda_const_ptr(&z_c)?;
-            let w_ptr = get_cuda_const_ptr(&weight)?;
+            let w_ptr = get_cuda_const_ptr(&norm_weight)?;
             let b_ptr = if let Some(ref b) = bias {
                 get_cuda_const_ptr(b)?
             } else {
@@ -535,34 +559,72 @@ pub fn gated_rmsnorm_silu_mul(
 
             unsafe {
                 match x.dtype() {
-                    DType::F16 => ffi::gdn_gated_rmsnorm_silu_mul_f16(
-                        x_ptr,
-                        z_ptr,
-                        w_ptr,
-                        b_ptr,
-                        out_ptr,
-                        rows as c_int,
-                        value_dim as c_int,
-                        group_size as c_int,
-                        eps,
-                        per_group_weights,
-                        bias.is_some(),
-                        stream,
-                    ),
-                    DType::BF16 => ffi::gdn_gated_rmsnorm_silu_mul_bf16(
-                        x_ptr,
-                        z_ptr,
-                        w_ptr,
-                        b_ptr,
-                        out_ptr,
-                        rows as c_int,
-                        value_dim as c_int,
-                        group_size as c_int,
-                        eps,
-                        per_group_weights,
-                        bias.is_some(),
-                        stream,
-                    ),
+                    DType::F16 => {
+                        if norm_weight.dtype() == DType::F32 {
+                            ffi::gdn_gated_rmsnorm_silu_mul_f16_wf32(
+                                x_ptr,
+                                z_ptr,
+                                w_ptr as *const f32,
+                                b_ptr as *const f32,
+                                out_ptr,
+                                rows as c_int,
+                                value_dim as c_int,
+                                group_size as c_int,
+                                eps,
+                                per_group_weights,
+                                bias.is_some(),
+                                stream,
+                            )
+                        } else {
+                            ffi::gdn_gated_rmsnorm_silu_mul_f16(
+                                x_ptr,
+                                z_ptr,
+                                w_ptr,
+                                b_ptr,
+                                out_ptr,
+                                rows as c_int,
+                                value_dim as c_int,
+                                group_size as c_int,
+                                eps,
+                                per_group_weights,
+                                bias.is_some(),
+                                stream,
+                            )
+                        }
+                    }
+                    DType::BF16 => {
+                        if norm_weight.dtype() == DType::F32 {
+                            ffi::gdn_gated_rmsnorm_silu_mul_bf16_wf32(
+                                x_ptr,
+                                z_ptr,
+                                w_ptr as *const f32,
+                                b_ptr as *const f32,
+                                out_ptr,
+                                rows as c_int,
+                                value_dim as c_int,
+                                group_size as c_int,
+                                eps,
+                                per_group_weights,
+                                bias.is_some(),
+                                stream,
+                            )
+                        } else {
+                            ffi::gdn_gated_rmsnorm_silu_mul_bf16(
+                                x_ptr,
+                                z_ptr,
+                                w_ptr,
+                                b_ptr,
+                                out_ptr,
+                                rows as c_int,
+                                value_dim as c_int,
+                                group_size as c_int,
+                                eps,
+                                per_group_weights,
+                                bias.is_some(),
+                                stream,
+                            )
+                        }
+                    }
                     DType::F32 => ffi::gdn_gated_rmsnorm_silu_mul_f32(
                         x_ptr as *const f32,
                         z_ptr as *const f32,
