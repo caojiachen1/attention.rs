@@ -1410,7 +1410,9 @@ __global__ void l2_norm_last_dim_warp_kernel(
     for (int offset = 16; offset > 0; offset >>= 1) {
         sumsq += __shfl_down_sync(0xffffffff, sumsq, offset);
     }
-    const float inv_norm = rsqrtf(fmaxf(sumsq, 0.0f) + eps);
+    // After down-shuffle reduction only lane 0 has the full sum; broadcast it.
+    const float row_sumsq = __shfl_sync(0xffffffff, sumsq, 0);
+    const float inv_norm = rsqrtf(fmaxf(row_sumsq, 0.0f) + eps);
 
     for (int i = lane_id; i < dim; i += 32) {
         out_row[i] = from_float<T>(to_float(in_row[i]) * inv_norm);
