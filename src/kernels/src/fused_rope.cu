@@ -168,16 +168,18 @@ fused_rope_i_bf16_kernel(
         const int64_t pos = positions[t_idx];
         const uint32_t cs_idx = pos * half_d + d_idx;
         
-        // Native BF16 compute
-        const __nv_bfloat16 c = cos[cs_idx];
-        const __nv_bfloat16 s = sin[cs_idx];
+        // Accumulate in F32 like the F16 path. Native BF16 arithmetic is too lossy here.
+        const float c = __bfloat162float(cos[cs_idx]);
+        const float s = __bfloat162float(sin[cs_idx]);
         
         __nv_bfloat162* ptr = is_q ? q : k;
         __nv_bfloat162 v = ptr[local_idx];
+        const float vx = __bfloat162float(v.x);
+        const float vy = __bfloat162float(v.y);
         
         __nv_bfloat162 result;
-        result.x = __hsub(__hmul(v.x, c), __hmul(v.y, s));
-        result.y = __hadd(__hmul(v.x, s), __hmul(v.y, c));
+        result.x = __float2bfloat16_rn(vx * c - vy * s);
+        result.y = __float2bfloat16_rn(vx * s + vy * c);
         
         ptr[local_idx] = result;
     }
@@ -301,16 +303,18 @@ fused_rope_i_tok_major_bf16_kernel(
 
         const int64_t pos = positions[token_idx];
         const uint32_t cs_idx = pos * half_d + d_idx;
-        const __nv_bfloat16 c = cos[cs_idx];
-        const __nv_bfloat16 s = sin[cs_idx];
+        const float c = __bfloat162float(cos[cs_idx]);
+        const float s = __bfloat162float(sin[cs_idx]);
 
         __nv_bfloat162* ptr = is_q ? q : k;
         const uint32_t pair_idx = (token_idx * heads + head_idx) * half_d + d_idx;
         const __nv_bfloat162 v = ptr[pair_idx];
+        const float vx = __bfloat162float(v.x);
+        const float vy = __bfloat162float(v.y);
 
         __nv_bfloat162 result;
-        result.x = __hsub(__hmul(v.x, c), __hmul(v.y, s));
-        result.y = __hadd(__hmul(v.x, s), __hmul(v.y, c));
+        result.x = __float2bfloat16_rn(vx * c - vy * s);
+        result.y = __float2bfloat16_rn(vx * s + vy * c);
         ptr[pair_idx] = result;
     }
 }
@@ -428,15 +432,15 @@ fused_rope_tok_major_bf16_kernel(
 
         const int64_t pos = positions[token_idx];
         const uint32_t cs_idx = pos * half_d + d_idx;
-        const __nv_bfloat16 c = cos[cs_idx];
-        const __nv_bfloat16 s = sin[cs_idx];
+        const float c = __bfloat162float(cos[cs_idx]);
+        const float s = __bfloat162float(sin[cs_idx]);
 
         __nv_bfloat16* ptr = is_q ? q : k;
         const uint32_t base = (token_idx * heads + head_idx) * d + d_idx;
-        const __nv_bfloat16 x = ptr[base];
-        const __nv_bfloat16 y = ptr[base + half_d];
-        ptr[base] = __hsub(__hmul(x, c), __hmul(y, s));
-        ptr[base + half_d] = __hadd(__hmul(y, c), __hmul(x, s));
+        const float x = __bfloat162float(ptr[base]);
+        const float y = __bfloat162float(ptr[base + half_d]);
+        ptr[base] = __float2bfloat16_rn(x * c - y * s);
+        ptr[base + half_d] = __float2bfloat16_rn(y * c + x * s);
     }
 }
 #endif
@@ -556,15 +560,15 @@ fused_rope_partial_tok_major_bf16_kernel(
 
         const int64_t pos = positions[token_idx];
         const uint32_t cs_idx = pos * half_rotary_d + d_idx;
-        const __nv_bfloat16 c = cos[cs_idx];
-        const __nv_bfloat16 s = sin[cs_idx];
+        const float c = __bfloat162float(cos[cs_idx]);
+        const float s = __bfloat162float(sin[cs_idx]);
 
         __nv_bfloat16* ptr = is_q ? q : k;
         const uint32_t base = (token_idx * heads + head_idx) * full_d + d_idx;
-        const __nv_bfloat16 x = ptr[base];
-        const __nv_bfloat16 y = ptr[base + half_rotary_d];
-        ptr[base] = __hsub(__hmul(x, c), __hmul(y, s));
-        ptr[base + half_rotary_d] = __hadd(__hmul(y, c), __hmul(x, s));
+        const float x = __bfloat162float(ptr[base]);
+        const float y = __bfloat162float(ptr[base + half_rotary_d]);
+        ptr[base] = __float2bfloat16_rn(x * c - y * s);
+        ptr[base + half_rotary_d] = __float2bfloat16_rn(y * c + x * s);
     }
 }
 #endif
@@ -685,16 +689,18 @@ fused_rope_i_partial_tok_major_bf16_kernel(
 
         const int64_t pos = positions[token_idx];
         const uint32_t cs_idx = pos * rotary_half_d + d_idx;
-        const __nv_bfloat16 c = cos[cs_idx];
-        const __nv_bfloat16 s = sin[cs_idx];
+        const float c = __bfloat162float(cos[cs_idx]);
+        const float s = __bfloat162float(sin[cs_idx]);
 
         __nv_bfloat162* ptr = is_q ? q : k;
         const uint32_t pair_idx = (token_idx * heads + head_idx) * full_half_d + d_idx;
         const __nv_bfloat162 v = ptr[pair_idx];
+        const float vx = __bfloat162float(v.x);
+        const float vy = __bfloat162float(v.y);
 
         __nv_bfloat162 result;
-        result.x = __hsub(__hmul(v.x, c), __hmul(v.y, s));
-        result.y = __hadd(__hmul(v.x, s), __hmul(v.y, c));
+        result.x = __float2bfloat16_rn(vx * c - vy * s);
+        result.y = __float2bfloat16_rn(vx * s + vy * c);
         ptr[pair_idx] = result;
     }
 }
@@ -851,19 +857,19 @@ fused_rope_bf16_kernel(
         const int64_t pos = positions[i_t];
         const uint32_t cs_idx = pos * half_d + i_d;
         
-        const __nv_bfloat16 c = cos[cs_idx];
-        const __nv_bfloat16 s = sin[cs_idx];
+        const float c = __bfloat162float(cos[cs_idx]);
+        const float s = __bfloat162float(sin[cs_idx]);
         
         const uint32_t td = seq_len * d;
         const uint32_t i1 = i_bh * td + i_t * d + i_d;
         const uint32_t i2 = i1 + half_d;
         
         __nv_bfloat16* ptr = is_q ? q : k;
-        __nv_bfloat16 x1 = ptr[i1];
-        __nv_bfloat16 x2 = ptr[i2];
-        
-        ptr[i1] = __hsub(__hmul(x1, c), __hmul(x2, s));
-        ptr[i2] = __hadd(__hmul(x1, s), __hmul(x2, c));
+        const float x1 = __bfloat162float(ptr[i1]);
+        const float x2 = __bfloat162float(ptr[i2]);
+
+        ptr[i1] = __float2bfloat16_rn(x1 * c - x2 * s);
+        ptr[i2] = __float2bfloat16_rn(x1 * s + x2 * c);
     }
 }
 #endif

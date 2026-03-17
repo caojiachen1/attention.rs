@@ -289,11 +289,11 @@ fn launch_fused_rope(
     let dev = q.device().as_cuda_device()?;
     let stream = *dev.cu_stream() as i64;
 
-    let q_storage = q.storage_and_layout().0;
-    let k_storage = k.storage_and_layout().0;
-    let cos_storage = cos.storage_and_layout().0;
-    let sin_storage = sin.storage_and_layout().0;
-    let pos_storage = positions.storage_and_layout().0;
+    let (q_storage, q_layout) = q.storage_and_layout();
+    let (k_storage, k_layout) = k.storage_and_layout();
+    let (cos_storage, cos_layout) = cos.storage_and_layout();
+    let (sin_storage, sin_layout) = sin.storage_and_layout();
+    let (pos_storage, pos_layout) = positions.storage_and_layout();
 
     let q_cuda = match &*q_storage {
         candle_core::Storage::Cuda(s) => s,
@@ -315,28 +315,33 @@ fn launch_fused_rope(
         candle_core::Storage::Cuda(s) => s,
         _ => candle_core::bail!("positions must be on CUDA"),
     };
+    let q_offset = q_layout.start_offset();
+    let k_offset = k_layout.start_offset();
+    let cos_offset = cos_layout.start_offset();
+    let sin_offset = sin_layout.start_offset();
+    let pos_offset = pos_layout.start_offset();
 
     let pos_ptr = match &pos_cuda.slice {
-        CudaStorageSlice::I64(s) => *s.device_ptr() as *const i64,
+        CudaStorageSlice::I64(s) => *s.slice(pos_offset..).device_ptr() as *const i64,
         _ => candle_core::bail!("positions must be I64"),
     };
 
     match dtype {
         DType::F32 => {
             let q_ptr = match &q_cuda.slice {
-                CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
+                CudaStorageSlice::F32(s) => *s.slice(q_offset..).device_ptr() as *mut f32,
                 _ => candle_core::bail!("Expected F32"),
             };
             let k_ptr = match &k_cuda.slice {
-                CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
+                CudaStorageSlice::F32(s) => *s.slice(k_offset..).device_ptr() as *mut f32,
                 _ => candle_core::bail!("Expected F32"),
             };
             let cos_ptr = match &cos_cuda.slice {
-                CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
+                CudaStorageSlice::F32(s) => *s.slice(cos_offset..).device_ptr() as *const f32,
                 _ => candle_core::bail!("Expected F32"),
             };
             let sin_ptr = match &sin_cuda.slice {
-                CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
+                CudaStorageSlice::F32(s) => *s.slice(sin_offset..).device_ptr() as *const f32,
                 _ => candle_core::bail!("Expected F32"),
             };
 
@@ -383,19 +388,27 @@ fn launch_fused_rope(
         }
         DType::F16 => {
             let q_ptr = match &q_cuda.slice {
-                CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                CudaStorageSlice::F16(s) => {
+                    *s.slice(q_offset..).device_ptr() as *mut core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected F16"),
             };
             let k_ptr = match &k_cuda.slice {
-                CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                CudaStorageSlice::F16(s) => {
+                    *s.slice(k_offset..).device_ptr() as *mut core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected F16"),
             };
             let cos_ptr = match &cos_cuda.slice {
-                CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                CudaStorageSlice::F16(s) => {
+                    *s.slice(cos_offset..).device_ptr() as *const core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected F16"),
             };
             let sin_ptr = match &sin_cuda.slice {
-                CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                CudaStorageSlice::F16(s) => {
+                    *s.slice(sin_offset..).device_ptr() as *const core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected F16"),
             };
 
@@ -442,19 +455,27 @@ fn launch_fused_rope(
         }
         DType::BF16 => {
             let q_ptr = match &q_cuda.slice {
-                CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                CudaStorageSlice::BF16(s) => {
+                    *s.slice(q_offset..).device_ptr() as *mut core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected BF16"),
             };
             let k_ptr = match &k_cuda.slice {
-                CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                CudaStorageSlice::BF16(s) => {
+                    *s.slice(k_offset..).device_ptr() as *mut core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected BF16"),
             };
             let cos_ptr = match &cos_cuda.slice {
-                CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                CudaStorageSlice::BF16(s) => {
+                    *s.slice(cos_offset..).device_ptr() as *const core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected BF16"),
             };
             let sin_ptr = match &sin_cuda.slice {
-                CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                CudaStorageSlice::BF16(s) => {
+                    *s.slice(sin_offset..).device_ptr() as *const core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected BF16"),
             };
 
@@ -578,11 +599,11 @@ fn launch_fused_rope_partial_token_major(
     let dev = q.device().as_cuda_device()?;
     let stream = *dev.cu_stream() as i64;
 
-    let q_storage = q.storage_and_layout().0;
-    let k_storage = k.storage_and_layout().0;
-    let cos_storage = cos.storage_and_layout().0;
-    let sin_storage = sin.storage_and_layout().0;
-    let pos_storage = positions.storage_and_layout().0;
+    let (q_storage, q_layout) = q.storage_and_layout();
+    let (k_storage, k_layout) = k.storage_and_layout();
+    let (cos_storage, cos_layout) = cos.storage_and_layout();
+    let (sin_storage, sin_layout) = sin.storage_and_layout();
+    let (pos_storage, pos_layout) = positions.storage_and_layout();
 
     let q_cuda = match &*q_storage {
         candle_core::Storage::Cuda(s) => s,
@@ -604,28 +625,33 @@ fn launch_fused_rope_partial_token_major(
         candle_core::Storage::Cuda(s) => s,
         _ => candle_core::bail!("positions must be on CUDA"),
     };
+    let q_offset = q_layout.start_offset();
+    let k_offset = k_layout.start_offset();
+    let cos_offset = cos_layout.start_offset();
+    let sin_offset = sin_layout.start_offset();
+    let pos_offset = pos_layout.start_offset();
 
     let pos_ptr = match &pos_cuda.slice {
-        CudaStorageSlice::I64(s) => *s.device_ptr() as *const i64,
+        CudaStorageSlice::I64(s) => *s.slice(pos_offset..).device_ptr() as *const i64,
         _ => candle_core::bail!("positions must be I64"),
     };
 
     match dtype {
         DType::F32 => {
             let q_ptr = match &q_cuda.slice {
-                CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
+                CudaStorageSlice::F32(s) => *s.slice(q_offset..).device_ptr() as *mut f32,
                 _ => candle_core::bail!("Expected F32"),
             };
             let k_ptr = match &k_cuda.slice {
-                CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32,
+                CudaStorageSlice::F32(s) => *s.slice(k_offset..).device_ptr() as *mut f32,
                 _ => candle_core::bail!("Expected F32"),
             };
             let cos_ptr = match &cos_cuda.slice {
-                CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
+                CudaStorageSlice::F32(s) => *s.slice(cos_offset..).device_ptr() as *const f32,
                 _ => candle_core::bail!("Expected F32"),
             };
             let sin_ptr = match &sin_cuda.slice {
-                CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32,
+                CudaStorageSlice::F32(s) => *s.slice(sin_offset..).device_ptr() as *const f32,
                 _ => candle_core::bail!("Expected F32"),
             };
             unsafe {
@@ -662,19 +688,27 @@ fn launch_fused_rope_partial_token_major(
         }
         DType::F16 => {
             let q_ptr = match &q_cuda.slice {
-                CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                CudaStorageSlice::F16(s) => {
+                    *s.slice(q_offset..).device_ptr() as *mut core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected F16"),
             };
             let k_ptr = match &k_cuda.slice {
-                CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                CudaStorageSlice::F16(s) => {
+                    *s.slice(k_offset..).device_ptr() as *mut core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected F16"),
             };
             let cos_ptr = match &cos_cuda.slice {
-                CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                CudaStorageSlice::F16(s) => {
+                    *s.slice(cos_offset..).device_ptr() as *const core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected F16"),
             };
             let sin_ptr = match &sin_cuda.slice {
-                CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                CudaStorageSlice::F16(s) => {
+                    *s.slice(sin_offset..).device_ptr() as *const core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected F16"),
             };
             unsafe {
@@ -711,19 +745,27 @@ fn launch_fused_rope_partial_token_major(
         }
         DType::BF16 => {
             let q_ptr = match &q_cuda.slice {
-                CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                CudaStorageSlice::BF16(s) => {
+                    *s.slice(q_offset..).device_ptr() as *mut core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected BF16"),
             };
             let k_ptr = match &k_cuda.slice {
-                CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void,
+                CudaStorageSlice::BF16(s) => {
+                    *s.slice(k_offset..).device_ptr() as *mut core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected BF16"),
             };
             let cos_ptr = match &cos_cuda.slice {
-                CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                CudaStorageSlice::BF16(s) => {
+                    *s.slice(cos_offset..).device_ptr() as *const core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected BF16"),
             };
             let sin_ptr = match &sin_cuda.slice {
-                CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void,
+                CudaStorageSlice::BF16(s) => {
+                    *s.slice(sin_offset..).device_ptr() as *const core::ffi::c_void
+                }
                 _ => candle_core::bail!("Expected BF16"),
             };
             unsafe {
