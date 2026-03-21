@@ -10,7 +10,7 @@
 // and states are updated in-place during forward passes.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[cfg(feature = "metal")]
 use candle_core::backend::BackendStorage;
@@ -288,8 +288,12 @@ pub struct MambaCache {
     prefix_cache_capacity: usize,
     /// Prefix hash -> captured slot states.
     prefix_states: HashMap<u64, PrefixStateSnapshot>,
-    /// LRU queue for prefix-state eviction.
+    /// Prefill-boundary hashes that should survive decode-time churn when possible.
+    preserved_prefix_states: HashSet<u64>,
+    /// LRU queue for ordinary decode-time snapshots.
     prefix_lru: VecDeque<u64>,
+    /// LRU queue for preserved prefill/chunk-prefill boundary snapshots.
+    preserved_prefix_lru: VecDeque<u64>,
 }
 
 #[derive(Clone)]
@@ -352,7 +356,9 @@ impl MambaCache {
             num_gdn_layers,
             prefix_cache_capacity: 0,
             prefix_states: HashMap::new(),
+            preserved_prefix_states: HashSet::new(),
             prefix_lru: VecDeque::new(),
+            preserved_prefix_lru: VecDeque::new(),
         })
     }
 
@@ -714,7 +720,9 @@ impl MambaCache {
         self.prefix_cache_capacity = capacity;
         if capacity == 0 {
             self.prefix_states.clear();
+            self.preserved_prefix_states.clear();
             self.prefix_lru.clear();
+            self.preserved_prefix_lru.clear();
             return;
         }
         self.evict_prefix_states_if_needed();
@@ -724,21 +732,45 @@ impl MambaCache {
         self.prefix_cache_capacity > 0 && self.prefix_states.contains_key(&hash)
     }
 
-    fn touch_prefix_state(&mut self, hash: u64) {
+    fn touch_prefix_state(&mut self, hash: u64, preserve: bool) {
+        let preserve = preserve || self.preserved_prefix_states.contains(&hash);
         self.prefix_lru.retain(|&h| h != hash);
-        self.prefix_lru.push_back(hash);
+        self.preserved_prefix_lru.retain(|&h| h != hash);
+        if preserve {
+            self.preserved_prefix_states.insert(hash);
+            self.preserved_prefix_lru.push_back(hash);
+        } else {
+            self.preserved_prefix_states.remove(&hash);
+            self.prefix_lru.push_back(hash);
+        }
+    }
+
+    fn remove_prefix_state(&mut self, hash: u64) {
+        self.prefix_states.remove(&hash);
+        self.preserved_prefix_states.remove(&hash);
+        self.prefix_lru.retain(|&h| h != hash);
+        self.preserved_prefix_lru.retain(|&h| h != hash);
     }
 
     fn evict_prefix_states_if_needed(&mut self) {
         while self.prefix_states.len() > self.prefix_cache_capacity {
-            let Some(hash) = self.prefix_lru.pop_front() else {
+            if let Some(hash) = self.prefix_lru.pop_front() {
+                self.remove_prefix_state(hash);
+                continue;
+            }
+            let Some(hash) = self.preserved_prefix_lru.pop_front() else {
                 break;
             };
-            let _ = self.prefix_states.remove(&hash);
+            self.remove_prefix_state(hash);
         }
     }
 
-    pub fn capture_prefix_state(&mut self, seq_id: usize, hash: u64) -> Result<bool> {
+    pub fn capture_prefix_state(
+        &mut self,
+        seq_id: usize,
+        hash: u64,
+        preserve: bool,
+    ) -> Result<bool> {
         if self.prefix_cache_capacity == 0 {
             return Ok(false);
         }
@@ -765,7 +797,7 @@ impl MambaCache {
                 recurrent_states,
             },
         );
-        self.touch_prefix_state(hash);
+        self.touch_prefix_state(hash, preserve);
         self.evict_prefix_states_if_needed();
         Ok(true)
     }
@@ -804,7 +836,7 @@ impl MambaCache {
                 &snapshot.recurrent_states[layer_idx],
             )?;
         }
-        self.touch_prefix_state(hash);
+        self.touch_prefix_state(hash, false);
         Ok(true)
     }
 
@@ -816,7 +848,9 @@ impl MambaCache {
         self.seq_to_slot.clear();
         self.free_slots = (0..self.max_batch_size).rev().collect();
         self.prefix_states.clear();
+        self.preserved_prefix_states.clear();
         self.prefix_lru.clear();
+        self.preserved_prefix_lru.clear();
         Ok(())
     }
 }
