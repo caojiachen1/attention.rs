@@ -99,7 +99,7 @@ fn main() -> Result<()> {
         builder = builder.arg("-DUSE_FLASHINFER").with_git_dependency(
             "flashinfer",
             "https://github.com/guoqingbao/flashinfer.git",
-            "3bffdb76eef5fec462254dde67a7de0c4bcb9905", // v0.6.2
+            "35e1a37733b452fe26c2a51ac38fca134b1efaa4", // v0.6.2
             vec![
                 "include",
                 "include/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export",
