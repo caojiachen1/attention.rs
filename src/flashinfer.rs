@@ -73,11 +73,11 @@ thread_local! {
 }
 
 fn is_supported_flashinfer_gqa_group_size(group_size: usize) -> bool {
-    matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 16 | 32 | 64)
+    matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
 }
 
 fn is_supported_flashinfer_decode_group_size(group_size: usize) -> bool {
-    matches!(group_size, 1 | 2 | 3 | 4 | 6 | 8 | 16 | 32 | 64)
+    matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
 }
 
 fn is_supported_flashinfer_decode_shape(group_size: usize, head_dim: usize) -> bool {

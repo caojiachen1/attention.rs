@@ -225,7 +225,7 @@ static inline void FillSM90RaggedParams(
 
 #ifdef USE_FLASHINFER
 static inline bool IsSupportedDecodeGroupSize(uint32_t group_size) {
-    return group_size == 1 || group_size == 2 || group_size == 3 || group_size == 4 ||
+    return group_size == 1 || group_size == 2 || group_size == 3 || group_size == 4 || group_size == 5 ||
            group_size == 6 || group_size == 8 || group_size == 16 || group_size == 32 || group_size == 64;
 }
 
