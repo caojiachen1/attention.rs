@@ -1238,18 +1238,39 @@ extern "C" {
     );
 
     #[cfg(feature = "flashinfer")]
-    pub fn flashinfer_prefill_wrapper(
+    pub fn flashinfer_prefill_plan_wrapper(
+        q_cu_seqlens_host: *const i32,
+        indptr_host: *const i32,
+        kv_len_arr_host: *const i32,
+        total_num_rows: i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        enable_cuda_graph: bool,
+        window_left: i32,
+        out_data_type: i32,
+        workspace_float: *mut c_void,
+        workspace_float_size: usize,
+        workspace_int: *mut c_void,
+        workspace_int_size: usize,
+        page_locked_buffer: *mut c_void,
+        page_locked_size: usize,
+        plan_info_out: *mut i64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_prefill_run_wrapper(
         out_ptr: *mut c_void,
         q_ptr: *const c_void,
-        q_cu_seqlens: *const i32,      // Device pointer for kernel params
-        q_cu_seqlens_host: *const i32, // Host pointer for planning
-        kv_len_arr_host: *const i32,   // Host pointer for kv lengths (fp8 sm90 plan)
-        total_num_rows: i32,           // Total tokens (from host)
+        q_cu_seqlens: *const i32,
+        total_num_rows: i32,
         k_data: *const c_void,
         v_data: *const c_void,
         indices: *const i32,
-        indptr: *const i32,      // Device pointer for paged_kv
-        indptr_host: *const i32, // Host pointer for planning
+        indptr: *const i32,
         last_len: *const i32,
         batch_size: i32,
         num_qo_heads: i32,
@@ -1263,13 +1284,11 @@ extern "C" {
         workspace_float_size: usize,
         workspace_int: *mut c_void,
         workspace_int_size: usize,
-        page_locked_int_buffer: *mut c_void,
-        page_locked_int_size: usize,
-        enable_cuda_graph: bool,
         window_left: i32,
         logits_soft_cap: f32,
         data_type: i32,
         out_data_type: i32,
+        plan_info_vec: *const i64,
         stream: i64,
     );
 
@@ -1331,6 +1350,25 @@ extern "C" {
         gate_up_scales: *const f32,
         down_weights: *const u8,
         down_scales: *const f32,
+        output: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        num_experts: i32,
+        top_k: i32,
+        input_dtype: i32,
+        stream: i64,
+    ) -> i32;
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_fused_moe_mxfp4(
+        input: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        gate_up_weights: *const u8,
+        gate_up_scales: *const u8,
+        down_weights: *const u8,
+        down_scales: *const u8,
         output: *mut c_void,
         num_tokens: i32,
         hidden_size: i32,
@@ -1782,6 +1820,433 @@ extern "C" {
         num_heads: c_int,
         k_dim: c_int,
         v_dim: c_int,
+        stream: i64,
+    );
+
+    // =========================================================================
+    // MXFP4 GEMM
+    // =========================================================================
+
+    pub fn mxfp4_matmul_smallm_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_smallm_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_wmma_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_matmul_wmma_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_indexed_moe_gemm_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_indexed_moe_gemm_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_get_max_smem_optin() -> c_int;
+
+    pub fn mxfp4_moe_grouped_gemm_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_wmma_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn mxfp4_moe_grouped_gemm_wmma_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    // ======================================================================
+    // NVFP4 GEMM kernels (block_size=16, FP8 E4M3 block scales + F32 global)
+    // ======================================================================
+
+    pub fn nvfp4_matmul_smallm_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_matmul_smallm_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_matmul_f16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_matmul_bf16(
+        input: *const c_void,
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_global_scale: f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_indexed_moe_gemm_f16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        weight_global_scales: *const f32,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    pub fn nvfp4_indexed_moe_gemm_bf16(
+        input: *const c_void,
+        weights: *const u8,
+        weight_scales: *const u8,
+        weight_global_scales: *const f32,
+        biases: *const c_void,
+        indices: *const u32,
+        output: *mut c_void,
+        num_tokens: c_int,
+        topk: c_int,
+        num_experts: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        input_has_topk_dim: bool,
+        stream: i64,
+    );
+
+    // ======================================================================
+    // GPT-OSS SwiGLU kernels
+    // ======================================================================
+
+    pub fn gptoss_swiglu_f16(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
+        stream: i64,
+    );
+
+    pub fn gptoss_swiglu_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
+        stream: i64,
+    );
+
+    pub fn gptoss_swiglu_f32(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        n: u32,
+        alpha: f32,
+        limit: f32,
+        stream: i64,
+    );
+
+    // =========================================================================
+    // MLA (Multi-head Latent Attention) cache update
+    // =========================================================================
+
+    pub fn concat_and_cache_mla(
+        ckv: *const c_void,
+        k_pe: *const c_void,
+        ckv_cache: *mut c_void,
+        kpe_cache: *mut c_void,
+        slot_mapping: *const i64,
+        num_tokens: c_int,
+        kv_lora_rank: c_int,
+        kpe_head_dim: c_int,
+        block_size: c_int,
+        ckv_stride: c_int,
+        kpe_stride: c_int,
+        stream: i64,
+        dtype: u32,
+    );
+
+    // =========================================================================
+    // FlashInfer MLA decode (plan + run)
+    // =========================================================================
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_mla_decode_plan_wrapper(
+        kv_indptr_host: *const i32,
+        batch_size: c_int,
+        num_qo_heads: c_int,
+        page_size: c_int,
+        float_workspace: *mut c_void,
+        float_workspace_size: i64,
+        int_workspace: *mut c_void,
+        int_workspace_size: i64,
+        page_locked_buffer: *mut c_void,
+        page_locked_size: i64,
+        enable_cuda_graph: bool,
+        dtype: u32,
+        plan_info_out: *mut i64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_mla_decode_run_wrapper(
+        o: *mut c_void,
+        q_nope: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        kv_indptr: *const i32,
+        kv_indices: *const i32,
+        kv_last_page_len: *const i32,
+        batch_size: c_int,
+        num_qo_heads: c_int,
+        page_size: c_int,
+        sm_scale: f32,
+        rope_scale: f32,
+        rope_theta: f32,
+        float_workspace: *mut c_void,
+        float_workspace_size: i64,
+        int_workspace: *mut c_void,
+        int_workspace_size: i64,
+        plan_info: *const i64,
+        dtype: u32,
+        stream: i64,
+    );
+
+    // =========================================================================
+    // FlashInfer MLA prefill (plan + run)
+    // =========================================================================
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_mla_prefill_plan_wrapper(
+        qo_indptr_host: *const i32,
+        kv_indptr_host: *const i32,
+        kv_len_arr_host: *const i32,
+        batch_size: c_int,
+        num_heads: c_int,
+        head_dim_ckv: c_int,
+        causal: bool,
+        float_workspace: *mut c_void,
+        float_workspace_size: i64,
+        int_workspace: *mut c_void,
+        int_workspace_size: i64,
+        page_locked_buffer: *mut c_void,
+        page_locked_size: i64,
+        plan_info_out: *mut i64,
+        stream: i64,
+    );
+
+    #[cfg(feature = "flashinfer")]
+    pub fn flashinfer_mla_prefill_run_wrapper(
+        o: *mut c_void,
+        q_nope: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        kv_indices: *const i32,
+        num_heads: c_int,
+        page_size: c_int,
+        sm_scale: f32,
+        float_workspace: *mut c_void,
+        float_workspace_size: i64,
+        int_workspace: *mut c_void,
+        int_workspace_size: i64,
+        plan_info: *const i64,
+        causal: bool,
+        dtype: u32,
         stream: i64,
     );
 }
