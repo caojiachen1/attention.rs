@@ -669,7 +669,7 @@ impl PagedAttention {
             let v_full = Tensor::cat(&v_parts, 0)?;
 
             let q_slice = query.narrow(0, q_start, q_len)?;
-            let q_4d = q_slice.unsqueeze(0)?.transpose(1, 2)?;
+            let q_4d = q_slice.unsqueeze(0)?.transpose(1, 2)?.contiguous()?;
 
             let k_t = k_full.transpose(0, 1)?.unsqueeze(0)?;
             let v_t = v_full.transpose(0, 1)?.unsqueeze(0)?;
@@ -708,7 +708,7 @@ impl PagedAttention {
             }
             let causal_mask = Tensor::from_vec(mask_data, (1, 1, q_len, ctx_len), &scores_dev)?
                 .to_dtype(scores_dtype)?;
-            scores = (scores + causal_mask)?;
+            scores = scores.broadcast_add(&causal_mask)?;
 
             let attn_weights =
                 candle_nn::ops::softmax_last_dim(&scores.to_dtype(candle_core::DType::F32)?)?
