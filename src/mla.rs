@@ -136,6 +136,209 @@ pub fn concat_and_cache_mla(
     }
 }
 
+/// Partition size for split-K decode (must match CUDA kernel constant).
+#[cfg(feature = "cuda")]
+const MLA_PARTITION_SIZE: usize = 128;
+
+/// Fused MLA paged attention decode (non-FlashInfer).
+///
+/// Uses split-K partitioned approach for long contexts to maintain stable
+/// throughput regardless of context length.
+///
+/// q_absorbed: [num_seqs, num_heads, kv_lora_rank]
+/// q_pe:       [num_seqs, num_heads, qk_rope_head_dim]
+/// ckv_cache:  [num_blocks, block_size, kv_lora_rank]
+/// kpe_cache:  [num_blocks, block_size, qk_rope_head_dim]
+/// block_tables: [num_seqs, max_num_blocks_per_seq] (i32)
+/// context_lens: [num_seqs] (i32)
+/// Returns: [num_seqs, num_heads, kv_lora_rank]
+#[cfg(feature = "cuda")]
+pub fn mla_paged_decode(
+    q_absorbed: &Tensor,
+    q_pe: &Tensor,
+    ckv_cache: &Tensor,
+    kpe_cache: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let num_seqs = q_absorbed.dim(0)?;
+    let num_heads = q_absorbed.dim(1)?;
+    let kv_lora_rank = q_absorbed.dim(2)?;
+    let qk_rope_head_dim = q_pe.dim(2)?;
+    let block_size = ckv_cache.dim(1)? as i32;
+    let max_num_blocks_per_seq = block_tables.dim(1)? as i32;
+    let dtype = dtype_to_u32(q_absorbed.dtype());
+
+    let output = Tensor::zeros(
+        (num_seqs, num_heads, kv_lora_rank),
+        q_absorbed.dtype(),
+        q_absorbed.device(),
+    )?;
+
+    let max_ctx = (max_num_blocks_per_seq as usize) * (block_size as usize);
+    let max_partitions = (max_ctx + MLA_PARTITION_SIZE - 1) / MLA_PARTITION_SIZE;
+    let use_partitioned = max_partitions > 1;
+
+    let out_ptr = get_cuda_ptr(&output)? as *mut core::ffi::c_void;
+    let q_abs_ptr = get_cuda_ptr(q_absorbed)?;
+    let q_pe_ptr = get_cuda_ptr(q_pe)?;
+    let ckv_cache_ptr = get_cuda_ptr(ckv_cache)?;
+    let kpe_cache_ptr = get_cuda_ptr(kpe_cache)?;
+
+    let bt_ptr = get_cuda_ptr(block_tables)? as *const core::ffi::c_int;
+    let cl_ptr = get_cuda_ptr(context_lens)? as *const core::ffi::c_int;
+
+    let dev = q_absorbed.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    if use_partitioned {
+        let tmp_out = Tensor::zeros(
+            &[num_seqs, num_heads, max_partitions, kv_lora_rank],
+            DType::F32,
+            q_absorbed.device(),
+        )?;
+        let tmp_max = Tensor::zeros(
+            &[num_seqs, num_heads, max_partitions],
+            DType::F32,
+            q_absorbed.device(),
+        )?;
+        let tmp_sum = Tensor::zeros(
+            &[num_seqs, num_heads, max_partitions],
+            DType::F32,
+            q_absorbed.device(),
+        )?;
+
+        let tmp_out_ptr = get_cuda_ptr(&tmp_out)? as *mut core::ffi::c_void;
+        let tmp_max_ptr = get_cuda_ptr(&tmp_max)? as *mut core::ffi::c_void;
+        let tmp_sum_ptr = get_cuda_ptr(&tmp_sum)? as *mut core::ffi::c_void;
+
+        unsafe {
+            kernels::ffi::mla_paged_attention_decode(
+                out_ptr,
+                q_abs_ptr,
+                q_pe_ptr,
+                ckv_cache_ptr,
+                kpe_cache_ptr,
+                bt_ptr,
+                cl_ptr,
+                scale,
+                num_seqs as i32,
+                num_heads as i32,
+                kv_lora_rank as i32,
+                qk_rope_head_dim as i32,
+                block_size,
+                max_num_blocks_per_seq,
+                dtype,
+                stream,
+                tmp_out_ptr,
+                tmp_max_ptr,
+                tmp_sum_ptr,
+                1,
+            );
+        }
+    } else {
+        unsafe {
+            kernels::ffi::mla_paged_attention_decode(
+                out_ptr,
+                q_abs_ptr,
+                q_pe_ptr,
+                ckv_cache_ptr,
+                kpe_cache_ptr,
+                bt_ptr,
+                cl_ptr,
+                scale,
+                num_seqs as i32,
+                num_heads as i32,
+                kv_lora_rank as i32,
+                qk_rope_head_dim as i32,
+                block_size,
+                max_num_blocks_per_seq,
+                dtype,
+                stream,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                0,
+            );
+        }
+    }
+    Ok(output)
+}
+
+/// Fused MLA paged attention prefill (non-FlashInfer).
+///
+/// q_absorbed: [total_tokens, num_heads, kv_lora_rank]
+/// q_pe:       [total_tokens, num_heads, qk_rope_head_dim]
+/// ckv_cache:  [num_blocks, block_size, kv_lora_rank]
+/// kpe_cache:  [num_blocks, block_size, qk_rope_head_dim]
+/// block_tables: [num_seqs, max_num_blocks_per_seq] (i32)
+/// context_lens: [num_seqs] (i32)
+/// cu_seqlens_q: [num_seqs + 1] (i32)
+/// Returns: [total_tokens, num_heads, kv_lora_rank]
+#[cfg(feature = "cuda")]
+pub fn mla_paged_prefill(
+    q_absorbed: &Tensor,
+    q_pe: &Tensor,
+    ckv_cache: &Tensor,
+    kpe_cache: &Tensor,
+    block_tables: &Tensor,
+    context_lens: &Tensor,
+    cu_seqlens_q: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let total_tokens = q_absorbed.dim(0)?;
+    let num_heads = q_absorbed.dim(1)?;
+    let kv_lora_rank = q_absorbed.dim(2)?;
+    let qk_rope_head_dim = q_pe.dim(2)?;
+    let block_size = ckv_cache.dim(1)? as i32;
+    let max_num_blocks_per_seq = block_tables.dim(1)? as i32;
+    let num_seqs = context_lens.dim(0)?;
+    let dtype = dtype_to_u32(q_absorbed.dtype());
+
+    let output = Tensor::zeros(
+        (total_tokens, num_heads, kv_lora_rank),
+        q_absorbed.dtype(),
+        q_absorbed.device(),
+    )?;
+
+    let out_ptr = get_cuda_ptr(&output)? as *mut core::ffi::c_void;
+    let q_abs_ptr = get_cuda_ptr(q_absorbed)?;
+    let q_pe_ptr = get_cuda_ptr(q_pe)?;
+    let ckv_cache_ptr = get_cuda_ptr(ckv_cache)?;
+    let kpe_cache_ptr = get_cuda_ptr(kpe_cache)?;
+
+    let bt_ptr = get_cuda_ptr(block_tables)? as *const core::ffi::c_int;
+    let cl_ptr = get_cuda_ptr(context_lens)? as *const core::ffi::c_int;
+    let cu_ptr = get_cuda_ptr(cu_seqlens_q)? as *const core::ffi::c_int;
+
+    let dev = q_absorbed.device().as_cuda_device()?;
+    let stream = *dev.cu_stream() as i64;
+
+    unsafe {
+        kernels::ffi::mla_paged_attention_prefill(
+            out_ptr,
+            q_abs_ptr,
+            q_pe_ptr,
+            ckv_cache_ptr,
+            kpe_cache_ptr,
+            bt_ptr,
+            cl_ptr,
+            cu_ptr,
+            scale,
+            num_seqs as i32,
+            num_heads as i32,
+            kv_lora_rank as i32,
+            qk_rope_head_dim as i32,
+            block_size,
+            max_num_blocks_per_seq,
+            dtype,
+            stream,
+        );
+    }
+    Ok(output)
+}
+
 /// MLA decode plan: CPU-side work estimation producing DecodePlanInfo (10 i64 values).
 #[cfg(feature = "flashinfer")]
 pub fn mla_decode_plan(

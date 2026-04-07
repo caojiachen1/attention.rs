@@ -2160,6 +2160,53 @@ extern "C" {
     );
 
     // =========================================================================
+    // Fused MLA paged attention (non-FlashInfer)
+    // =========================================================================
+
+    pub fn mla_paged_attention_decode(
+        out: *mut c_void,
+        q_abs: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        scale: f32,
+        num_seqs: c_int,
+        num_heads: c_int,
+        kv_lora_rank: c_int,
+        qk_rope_head_dim: c_int,
+        block_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        dtype: u32,
+        stream: i64,
+        tmp_out_buf: *mut c_void,
+        tmp_max_buf: *mut c_void,
+        tmp_sum_buf: *mut c_void,
+        use_partitioned: c_int,
+    );
+
+    pub fn mla_paged_attention_prefill(
+        out: *mut c_void,
+        q_abs: *const c_void,
+        q_pe: *const c_void,
+        ckv_cache: *const c_void,
+        kpe_cache: *const c_void,
+        block_tables: *const c_int,
+        context_lens: *const c_int,
+        cu_seqlens_q: *const c_int,
+        scale: f32,
+        num_seqs: c_int,
+        num_heads: c_int,
+        kv_lora_rank: c_int,
+        qk_rope_head_dim: c_int,
+        block_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        dtype: u32,
+        stream: i64,
+    );
+
+    // =========================================================================
     // FlashInfer MLA decode (plan + run)
     // =========================================================================
 
