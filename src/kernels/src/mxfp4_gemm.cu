@@ -719,7 +719,6 @@ extern "C" void mxfp4_matmul_smallm_f16(const __half *input,
   CUDA_CHECK(cudaGetLastError());
 }
 
-#ifndef NO_BF16_KERNEL
 extern "C" void mxfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                           const uint8_t *weight,
                                           const uint8_t *weight_scale,
@@ -727,6 +726,7 @@ extern "C" void mxfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                           __nv_bfloat16 *output,
                                           int M, int N, int K, bool has_bias,
                                           cudaStream_t stream) {
+#ifndef NO_BF16_KERNEL
   using namespace mxfp4_gemm;
   constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
   dim3 block(THREADS);
@@ -737,8 +737,8 @@ extern "C" void mxfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
       <<<grid, block, smem, stream>>>(input, weight, weight_scale, bias,
                                       output, M, N, K, has_bias);
   CUDA_CHECK(cudaGetLastError());
-}
 #endif
+}
 
 extern "C" void mxfp4_matmul_f16(const __half *input,
                                   const uint8_t *weight,
@@ -759,12 +759,12 @@ extern "C" void mxfp4_matmul_f16(const __half *input,
   CUDA_CHECK(cudaGetLastError());
 }
 
-#ifndef NO_BF16_KERNEL
 extern "C" void
 mxfp4_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weight,
                    const uint8_t *weight_scale, const __nv_bfloat16 *bias,
                    __nv_bfloat16 *output, int M, int N, int K,
                    bool has_bias, cudaStream_t stream) {
+#ifndef NO_BF16_KERNEL
   constexpr int BM = 64, BN = 64, BK = 32, TM = 4, TN = 4;
   constexpr int THREADS_N = BN / TN;
   constexpr int THREADS_M = BM / TM;
@@ -776,8 +776,8 @@ mxfp4_matmul_bf16(const __nv_bfloat16 *input, const uint8_t *weight,
       <<<grid, block, 0, stream>>>(input, weight, weight_scale, bias, output, M,
                                    N, K, has_bias);
   CUDA_CHECK(cudaGetLastError());
-}
 #endif
+}
 
 extern "C" void mxfp4_indexed_moe_gemm_f16(
     const __half *input, const uint8_t *weights, const uint8_t *weight_scales,
@@ -800,13 +800,13 @@ extern "C" void mxfp4_indexed_moe_gemm_f16(
   CUDA_CHECK(cudaGetLastError());
 }
 
-#ifndef NO_BF16_KERNEL
 extern "C" void mxfp4_indexed_moe_gemm_bf16(
     const __nv_bfloat16 *input, const uint8_t *weights,
     const uint8_t *weight_scales, const __nv_bfloat16 *biases,
     const uint32_t *indices, __nv_bfloat16 *output, int num_tokens, int topk,
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
     cudaStream_t stream) {
+#ifndef NO_BF16_KERNEL
   constexpr int THREADS_PER_BLOCK = MOE_BLOCK_N * 32;
   int n_chunks = CEILDIV(N, MOE_BLOCK_N);
 
@@ -822,8 +822,8 @@ extern "C" void mxfp4_indexed_moe_gemm_bf16(
           input, weights, weight_scales, biases, indices, output, num_tokens,
           topk, num_experts, N, K, has_bias, input_has_topk_dim);
   CUDA_CHECK(cudaGetLastError());
-}
 #endif
+}
 
 extern "C" int mxfp4_get_max_smem_optin() {
   int max_smem = 0;
@@ -890,16 +890,16 @@ extern "C" void mxfp4_moe_grouped_gemm_f16(
       num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim, stream);
 }
 
-#ifndef NO_BF16_KERNEL
 extern "C" void mxfp4_moe_grouped_gemm_bf16(
     const __nv_bfloat16 *input, const uint8_t *weights,
     const uint8_t *weight_scales, const __nv_bfloat16 *biases,
     const uint32_t *indices, __nv_bfloat16 *output, int num_tokens, int topk,
     int num_experts, int N, int K, bool has_bias, bool input_has_topk_dim,
     cudaStream_t stream) {
+#ifndef NO_BF16_KERNEL
   constexpr int BM = 64, BN = 64, BK = 32, TM = 4, TN = 4;
   launch_moe_tiled<__nv_bfloat16, BM, BN, BK, TM, TN>(
       input, weights, weight_scales, biases, indices, output,
       num_tokens, topk, num_experts, N, K, has_bias, input_has_topk_dim, stream);
-}
 #endif
+}
