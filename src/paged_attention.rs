@@ -133,9 +133,10 @@ impl PagedAttention {
             || head_size == 112
             || head_size == 128
             || head_size == 192
-            || head_size == 256)
+            || head_size == 256
+            || head_size == 512)
         {
-            candle::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192 or 256");
+            candle::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192, 256 or 512");
         }
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
@@ -479,9 +480,10 @@ impl PagedAttention {
             || head_size == 96
             || head_size == 112
             || head_size == 128
-            || head_size == 256)
+            || head_size == 256
+            || head_size == 512)
         {
-            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128 or 256");
+            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 256 or 512");
         }
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
@@ -885,25 +887,22 @@ impl ReshapeCache {
             )
         }
 
-        #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
-        if kc_rank != 4 {
+        let is_flash_cache = kc_rank == 4;
+        if kc_rank != 4 && kc_rank != 5 {
             candle::bail!(
-                "flash-format expects `key_cache` tensor to be of rank 4 \
+                "reshape_and_cache expects key_cache rank 4 (flash) or 5 (paged), got {kc_rank} \
                     (key_cache: {kc_l:?})"
             )
         }
-
-        #[cfg(not(any(feature = "flashattn", feature = "flashinfer")))]
-        if kc_rank != 5 {
+        if is_flash_cache && vc_rank != 4 {
             candle::bail!(
-                "paged-attention expects `key_cache` tensor to be of rank 5 \
-                    (key_cache: {kc_l:?})"
+                "flash-format expects value_cache rank 4, got {vc_rank} \
+                    (value_cache: {vc_l:?})"
             )
         }
-
-        if vc_rank != 4 {
+        if !is_flash_cache && vc_rank != 4 {
             candle::bail!(
-                "paged-attention expects `value_cache` tensor to be of rank 4 \
+                "paged-attention expects value_cache rank 4, got {vc_rank} \
                     (value_cache: {vc_l:?})"
             )
         }
@@ -923,29 +922,31 @@ impl ReshapeCache {
             candle::bail!("shape mismatch k {:?} and v {:?}", k_l.shape(), v_l.shape())
         }
 
-        #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
-        let (block_size, _x) = {
-            // [num_blocks, block_size, num_heads, head_size]
+        let (block_size, x) = if is_flash_cache {
             let (_, block_size, _, _) = kc_l.shape().dims4()?;
-            (block_size, 1)
-        };
-
-        #[cfg(not(any(feature = "flashattn", feature = "flashinfer")))]
-        let (block_size, x) = {
-            let (num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
+            (block_size, 1usize)
+        } else {
+            let (_num_blocks, num_heads_kc, head_size_kc, block_size, x) = kc_l.shape().dims5()?;
             if num_heads_kc != num_heads || head_size_kc != head_size / x {
                 candle::bail!(
-                    "shape mismatch value_cache {:?}, expected {:?}",
-                    vc_l.shape(),
-                    (num_blocks, num_heads, head_size / x, block_size, x)
+                    "shape mismatch key_cache {:?}, expected ({}, {}, {}, {}, {})",
+                    kc_l.shape(),
+                    _num_blocks,
+                    num_heads,
+                    head_size / x,
+                    block_size,
+                    x
                 )
             }
-
-            if (num_blocks, num_heads, head_size, block_size) != vc_l.shape().dims4()? {
+            let (vn, vh, vd, vb) = vc_l.shape().dims4()?;
+            if vh != num_heads || vd != head_size || vb != block_size {
                 candle::bail!(
-                    "shape mismatch key_cache {:?} and value_cache {:?}",
-                    kc_l.shape(),
-                    vc_l.shape()
+                    "shape mismatch value_cache {:?}, expected ({}, {}, {}, {})",
+                    vc_l.shape(),
+                    vn,
+                    num_heads,
+                    head_size,
+                    block_size
                 )
             }
             (block_size, x)
@@ -1005,8 +1006,7 @@ impl ReshapeCache {
             };
 
         unsafe {
-            #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
-            {
+            if is_flash_cache {
                 assert!(
                     k_scales_ptr.is_null() && v_scales_ptr.is_null(),
                     "fp8 kvcache is not supported under flash context!"
@@ -1016,13 +1016,13 @@ impl ReshapeCache {
                 let head_stride = kc_l.stride()[2];
 
                 kernels::ffi::call_reshape_and_cache_flash(
-                    k_ptr,  // [num_tokens, num_heads, head_size]
-                    v_ptr,  // [num_tokens, num_heads, head_size]
-                    kc_ptr, // [num_blocks, block_size, num_heads, head_size]
-                    vc_ptr, // [num_blocks, block_size, num_heads, head_size]
+                    k_ptr,
+                    v_ptr,
+                    kc_ptr,
+                    vc_ptr,
                     k_scales_ptr,
                     v_scales_ptr,
-                    s_ptr, // [num_tokens]
+                    s_ptr,
                     num_tokens as c_int,
                     num_heads as c_int,
                     head_size as c_int,
@@ -1035,9 +1035,7 @@ impl ReshapeCache {
                     internal_type,
                     *dev.cu_stream() as i64,
                 );
-            }
-            #[cfg(not(any(feature = "flashattn", feature = "flashinfer")))]
-            {
+            } else {
                 kernels::ffi::call_reshape_and_cache(
                     k_ptr,
                     v_ptr,

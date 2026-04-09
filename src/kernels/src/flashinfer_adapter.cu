@@ -1057,16 +1057,30 @@ void flashinfer_prefill_run_wrapper(
                 num_qo_heads, num_kv_heads, head_dim, page_size,
                 total_num_rows, sm_scale, indices, workspace_int, window_left, logits_soft_cap, plan_info);
 
-            using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+            bool use_swa = (window_left > 0);
+            using AttentionNoSWA = DefaultAttentionAlias<false, false, false, false>;
+            using AttentionSWA   = DefaultAttentionAlias<false, true,  false, false>;
             DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
-                if (plan_info.same_schedule_for_all_heads) {
-                    BatchPrefillWithPagedKVCacheDispatched<
-                        HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionType>(
-                        params, false, stream);
+                if (use_swa) {
+                    if (plan_info.same_schedule_for_all_heads) {
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, true, true, AttentionSWA>(
+                            params, false, stream);
+                    } else {
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, true, false, AttentionSWA>(
+                            params, false, stream);
+                    }
                 } else {
-                    BatchPrefillWithPagedKVCacheDispatched<
-                        HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionType>(
-                        params, false, stream);
+                    if (plan_info.same_schedule_for_all_heads) {
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, true, AttentionNoSWA>(
+                            params, false, stream);
+                    } else {
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            HEAD_DIM, HEAD_DIM, MaskMode::kCausal, false, false, AttentionNoSWA>(
+                            params, false, stream);
+                    }
                 }
             });
         };
@@ -1136,14 +1150,25 @@ void flashinfer_prefill_run_wrapper(
                     tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
                 }
 
-                using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+                bool use_swa = (window_left > 0);
                 DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-                    BatchPrefillWithPagedKVCacheDispatched<
-                        CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
-                        PosEncodingMode::kNone, false, MaskMode::kCausal,
-                        AttentionType, ParamsType>(
-                        params, tmp_v, tmp_s, false, stream
-                    );
+                    if (use_swa) {
+                        using AttentionType = DefaultAttentionAlias<false, true, false, false>;
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                            PosEncodingMode::kNone, false, MaskMode::kCausal,
+                            AttentionType, ParamsType>(
+                            params, tmp_v, tmp_s, false, stream
+                        );
+                    } else {
+                        using AttentionType = DefaultAttentionAlias<false, false, false, false>;
+                        BatchPrefillWithPagedKVCacheDispatched<
+                            CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                            PosEncodingMode::kNone, false, MaskMode::kCausal,
+                            AttentionType, ParamsType>(
+                            params, tmp_v, tmp_s, false, stream
+                        );
+                    }
                 });
             });
         };

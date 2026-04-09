@@ -401,330 +401,6 @@ impl PagedAttention {
         }
     }
 
-    /// SDP attention path that works with flash-format KV cache (rank-4).
-    /// Automatically used for head_dim > 256 where FlashAttn/FlashInfer kernels
-    /// don't support the dimension. Cache format: (num_blocks, block_size, num_heads, head_dim).
-    #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn sdp_with_flash_cache(
-        &self,
-        query: &Tensor,
-        key: &Tensor,
-        value: &Tensor,
-        attention_mask: Option<&Vec<Tensor>>,
-        key_cache: Option<Tensor>,
-        value_cache: Option<Tensor>,
-        input_metadata: &InputMetadata,
-        softcapping: Option<f64>,
-    ) -> Result<Tensor> {
-        let att = if input_metadata.is_prefill && input_metadata.block_tables.is_none() {
-            Some(self.sdp_prefill(
-                query,
-                key,
-                value,
-                attention_mask,
-                input_metadata,
-                softcapping,
-            )?)
-        } else {
-            None
-        };
-
-        let slot_mapping = input_metadata.slot_mapping.flatten_all()?;
-        let (query, key, value, attention_heads, key_value_heads, head_size) =
-            Self::batch_major_qkv(query, key, value)?;
-
-        let key = key
-            .transpose(1, 2)?
-            .reshape(((), key_value_heads, head_size))?;
-        let value = value
-            .transpose(1, 2)?
-            .reshape(((), key_value_heads, head_size))?;
-
-        self.maybe_update_kv_scales(&key, &value)?;
-
-        if key_cache.as_ref().is_some_and(|_| value_cache.is_some()) {
-            reshape_and_cache(
-                &key,
-                &value,
-                key_cache.as_ref().unwrap(),
-                value_cache.as_ref().unwrap(),
-                self.k_scale.as_ref(),
-                self.v_scale.as_ref(),
-                &slot_mapping,
-            )?;
-        }
-
-        if let Some(att) = att {
-            return Ok(att);
-        }
-
-        let block_tables = input_metadata.block_tables.as_ref().unwrap();
-        let context_lens = input_metadata.context_lens.as_ref().unwrap();
-        let query = query
-            .transpose(1, 2)?
-            .reshape(((), attention_heads, head_size))?;
-
-        if input_metadata.is_prefill && input_metadata.block_tables.is_some() {
-            return self.sdp_chunked_prefill_flash_cache(
-                &query,
-                &key_cache,
-                &value_cache,
-                block_tables,
-                context_lens,
-                input_metadata,
-                softcapping,
-                attention_heads,
-                key_value_heads,
-                head_size,
-            );
-        }
-
-        self.sdp_decode_flash_cache(
-            &query,
-            &key_cache,
-            &value_cache,
-            block_tables,
-            context_lens,
-            softcapping,
-            attention_heads,
-            key_value_heads,
-            head_size,
-        )
-    }
-
-    /// Decode from flash-format KV cache using manual attention.
-    /// Flash cache shape: (num_blocks, block_size, num_kv_heads, head_dim)
-    #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
-    #[allow(clippy::too_many_arguments)]
-    fn sdp_decode_flash_cache(
-        &self,
-        query: &Tensor,
-        key_cache: &Option<Tensor>,
-        value_cache: &Option<Tensor>,
-        block_tables: &Tensor,
-        context_lens: &Tensor,
-        softcapping: Option<f64>,
-        attention_heads: usize,
-        key_value_heads: usize,
-        head_size: usize,
-    ) -> Result<Tensor> {
-        let kc = key_cache.as_ref().unwrap();
-        let vc = value_cache.as_ref().unwrap();
-        let block_size = kc.dim(1)?;
-        let batch_size = query.dim(0)?;
-        let gqa_ratio = attention_heads / key_value_heads;
-
-        let block_tables_cpu = block_tables.to_vec2::<u32>()?;
-        let context_lens_cpu = context_lens.to_vec1::<u32>()?;
-
-        let mut results = Vec::with_capacity(batch_size);
-        for b in 0..batch_size {
-            let ctx_len = context_lens_cpu[b] as usize;
-            let blocks = &block_tables_cpu[b];
-            let num_blocks_needed = (ctx_len + block_size - 1) / block_size;
-
-            let mut k_parts = Vec::with_capacity(num_blocks_needed);
-            let mut v_parts = Vec::with_capacity(num_blocks_needed);
-
-            for blk_idx in 0..num_blocks_needed {
-                let block_id = blocks[blk_idx] as usize;
-                let tokens_in_block = if blk_idx == num_blocks_needed - 1 {
-                    let rem = ctx_len % block_size;
-                    if rem == 0 {
-                        block_size
-                    } else {
-                        rem
-                    }
-                } else {
-                    block_size
-                };
-                // kc shape: (num_blocks, block_size, num_kv_heads, head_dim)
-                let kb = kc
-                    .narrow(0, block_id, 1)?
-                    .squeeze(0)?
-                    .narrow(0, 0, tokens_in_block)?;
-                let vb = vc
-                    .narrow(0, block_id, 1)?
-                    .squeeze(0)?
-                    .narrow(0, 0, tokens_in_block)?;
-                k_parts.push(kb);
-                v_parts.push(vb);
-            }
-
-            // (ctx_len, num_kv_heads, head_dim)
-            let k_full = Tensor::cat(&k_parts, 0)?;
-            let v_full = Tensor::cat(&v_parts, 0)?;
-
-            // q: (1, attention_heads, head_size) -> (1, attention_heads, head_size)
-            let q_b = query.narrow(0, b, 1)?;
-
-            // Expand KV for GQA
-            // k_full: (ctx_len, kv_heads, hd) -> (1, kv_heads, ctx_len, hd) -> (1, attn_heads, ctx_len, hd)
-            let k_t = k_full.transpose(0, 1)?.unsqueeze(0)?; // (1, kv_heads, ctx_len, hd)
-            let v_t = v_full.transpose(0, 1)?.unsqueeze(0)?;
-
-            let (k_t, v_t) = if gqa_ratio > 1 {
-                let k_expanded = k_t
-                    .unsqueeze(2)?
-                    .expand((1, key_value_heads, gqa_ratio, ctx_len, head_size))?
-                    .reshape((1, attention_heads, ctx_len, head_size))?;
-                let v_expanded = v_t
-                    .unsqueeze(2)?
-                    .expand((1, key_value_heads, gqa_ratio, ctx_len, head_size))?
-                    .reshape((1, attention_heads, ctx_len, head_size))?;
-                (k_expanded, v_expanded)
-            } else {
-                (k_t.contiguous()?, v_t.contiguous()?)
-            };
-
-            // q_b: (1, attn_heads, hd) -> (1, attn_heads, 1, hd)
-            let q_4d = q_b.unsqueeze(2)?;
-
-            // scores: (1, attn_heads, 1, ctx_len)
-            let mut scores = (q_4d.matmul(&k_t.t()?.contiguous()?)? * f64::from(self.scale))?;
-            if let Some(sc) = softcapping {
-                if sc != 0.0 {
-                    scores = ((scores / sc)?.tanh()? * sc)?;
-                }
-            }
-
-            let scores_dtype = scores.dtype();
-            let attn_weights =
-                candle_nn::ops::softmax_last_dim(&scores.to_dtype(candle_core::DType::F32)?)?
-                    .to_dtype(scores_dtype)?;
-
-            // (1, attn_heads, 1, hd)
-            let out = attn_weights.matmul(&v_t.contiguous()?)?;
-            // -> (1, attn_heads, hd)
-            results.push(out.squeeze(2)?);
-        }
-
-        Tensor::cat(&results, 0)
-    }
-
-    /// Chunked prefill from flash-format KV cache using SDP.
-    #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
-    #[allow(clippy::too_many_arguments)]
-    fn sdp_chunked_prefill_flash_cache(
-        &self,
-        query: &Tensor,
-        key_cache: &Option<Tensor>,
-        value_cache: &Option<Tensor>,
-        block_tables: &Tensor,
-        context_lens: &Tensor,
-        input_metadata: &InputMetadata,
-        softcapping: Option<f64>,
-        attention_heads: usize,
-        key_value_heads: usize,
-        head_size: usize,
-    ) -> Result<Tensor> {
-        let kc = key_cache.as_ref().unwrap();
-        let vc = value_cache.as_ref().unwrap();
-        let block_size = kc.dim(1)?;
-        let gqa_ratio = attention_heads / key_value_heads;
-
-        let cu_seqlens_q = input_metadata.cu_seqlens_q.as_ref().unwrap();
-        let cu_seqlens_q_cpu = cu_seqlens_q.to_vec1::<u32>()?;
-        let block_tables_cpu = block_tables.to_vec2::<u32>()?;
-        let context_lens_cpu = context_lens.to_vec1::<u32>()?;
-        let num_seqs = cu_seqlens_q_cpu.len() - 1;
-
-        let mut results = Vec::with_capacity(num_seqs);
-        for s in 0..num_seqs {
-            let q_start = cu_seqlens_q_cpu[s] as usize;
-            let q_end = cu_seqlens_q_cpu[s + 1] as usize;
-            let q_len = q_end - q_start;
-            let ctx_len = context_lens_cpu[s] as usize;
-            let blocks = &block_tables_cpu[s];
-            let num_blocks_needed = (ctx_len + block_size - 1) / block_size;
-
-            let mut k_parts = Vec::with_capacity(num_blocks_needed);
-            let mut v_parts = Vec::with_capacity(num_blocks_needed);
-            for blk_idx in 0..num_blocks_needed {
-                let block_id = blocks[blk_idx] as usize;
-                let tokens_in_block = if blk_idx == num_blocks_needed - 1 {
-                    let rem = ctx_len % block_size;
-                    if rem == 0 {
-                        block_size
-                    } else {
-                        rem
-                    }
-                } else {
-                    block_size
-                };
-                k_parts.push(kc.narrow(0, block_id, 1)?.squeeze(0)?.narrow(
-                    0,
-                    0,
-                    tokens_in_block,
-                )?);
-                v_parts.push(vc.narrow(0, block_id, 1)?.squeeze(0)?.narrow(
-                    0,
-                    0,
-                    tokens_in_block,
-                )?);
-            }
-
-            let k_full = Tensor::cat(&k_parts, 0)?;
-            let v_full = Tensor::cat(&v_parts, 0)?;
-
-            let q_slice = query.narrow(0, q_start, q_len)?;
-            let q_4d = q_slice.unsqueeze(0)?.transpose(1, 2)?.contiguous()?;
-
-            let k_t = k_full.transpose(0, 1)?.unsqueeze(0)?;
-            let v_t = v_full.transpose(0, 1)?.unsqueeze(0)?;
-
-            let (k_t, v_t) = if gqa_ratio > 1 {
-                let k_e = k_t
-                    .unsqueeze(2)?
-                    .expand((1, key_value_heads, gqa_ratio, ctx_len, head_size))?
-                    .reshape((1, attention_heads, ctx_len, head_size))?;
-                let v_e = v_t
-                    .unsqueeze(2)?
-                    .expand((1, key_value_heads, gqa_ratio, ctx_len, head_size))?
-                    .reshape((1, attention_heads, ctx_len, head_size))?;
-                (k_e, v_e)
-            } else {
-                (k_t.contiguous()?, v_t.contiguous()?)
-            };
-
-            let mut scores = (q_4d.matmul(&k_t.t()?.contiguous()?)? * f64::from(self.scale))?;
-            if let Some(sc) = softcapping {
-                if sc != 0.0 {
-                    scores = ((scores / sc)?.tanh()? * sc)?;
-                }
-            }
-
-            // Causal mask: only attend to positions <= current position
-            let q_positions_start = ctx_len - q_len;
-            let scores_dev = scores.device().clone();
-            let scores_dtype = scores.dtype();
-            let mut mask_data = vec![0.0f32; q_len * ctx_len];
-            for qi in 0..q_len {
-                let abs_pos = q_positions_start + qi;
-                for ki in (abs_pos + 1)..ctx_len {
-                    mask_data[qi * ctx_len + ki] = f32::NEG_INFINITY;
-                }
-            }
-            let causal_mask = Tensor::from_vec(mask_data, (1, 1, q_len, ctx_len), &scores_dev)?
-                .to_dtype(scores_dtype)?;
-            scores = scores.broadcast_add(&causal_mask)?;
-
-            let attn_weights =
-                candle_nn::ops::softmax_last_dim(&scores.to_dtype(candle_core::DType::F32)?)?
-                    .to_dtype(scores_dtype)?;
-
-            let out = attn_weights.matmul(&v_t.contiguous()?)?;
-            results.push(out.transpose(1, 2)?.contiguous()?.reshape((
-                q_len,
-                attention_heads,
-                head_size,
-            ))?);
-        }
-
-        Tensor::cat(&results, 0)
-    }
-
     #[cfg(feature = "flashattn")]
     pub fn flash_forward(
         &self,
@@ -818,139 +494,127 @@ impl PagedAttention {
         input_metadata: &InputMetadata,
         softcapping: Option<f64>,
     ) -> Result<Tensor> {
-        // Auto-detect head_dim > 256: FlashAttn/FlashInfer kernels don't support it,
-        // use SDP with flash-format cache instead (works with both backends).
-        #[cfg(any(feature = "flashattn", feature = "flashinfer"))]
-        {
-            let head_size = self.head_dim;
-            if head_size > 256 {
-                return self.sdp_with_flash_cache(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    key_cache,
-                    value_cache,
-                    input_metadata,
-                    softcapping,
-                );
-            }
-        }
+        // head_dim > 256: FlashAttn/FlashInfer don't support it.
+        // These layers use paged attention format KV cache, so skip flash paths
+        // and fall through to the standard paged attention path below.
+        let use_paged_for_large_head = self.head_dim > 256;
 
         #[cfg(feature = "flashinfer")]
-        if let Some(fm) = input_metadata.flashinfer_metadata.as_ref() {
-            let (query, key, value, attention_heads, key_value_heads, head_size) =
-                Self::packed_qkv(query, key, value)?;
-            let group_size = attention_heads / key_value_heads;
-            let flashinfer_prefill_group_supported =
-                matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64);
-            let flashinfer_decode_group_supported =
-                flashinfer_prefill_group_supported && !(group_size == 64 && head_size > 128);
-            let flashinfer_group_supported = if input_metadata.is_prefill {
-                flashinfer_prefill_group_supported
-            } else {
-                flashinfer_decode_group_supported
-            };
+        if !use_paged_for_large_head {
+            if let Some(fm) = input_metadata.flashinfer_metadata.as_ref() {
+                let (query, key, value, attention_heads, key_value_heads, head_size) =
+                    Self::packed_qkv(query, key, value)?;
+                let group_size = attention_heads / key_value_heads;
+                let flashinfer_prefill_group_supported =
+                    matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64);
+                let flashinfer_decode_group_supported =
+                    flashinfer_prefill_group_supported && !(group_size == 64 && head_size > 128);
+                let flashinfer_group_supported = if input_metadata.is_prefill {
+                    flashinfer_prefill_group_supported
+                } else {
+                    flashinfer_decode_group_supported
+                };
 
-            if flashinfer_group_supported {
-                if let Some(kc) = key_cache.as_ref() {
-                    if kc.dtype() == candle_core::DType::U8 {
-                        candle_core::bail!(
-                            "flashinfer in the current build does not support fp8 kvcache!",
-                        );
+                if flashinfer_group_supported {
+                    if let Some(kc) = key_cache.as_ref() {
+                        if kc.dtype() == candle_core::DType::U8 {
+                            candle_core::bail!(
+                                "flashinfer in the current build does not support fp8 kvcache!",
+                            );
+                        }
                     }
+
+                    self.maybe_update_kv_scales(&key, &value)?;
+
+                    if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
+                        crate::flashinfer::append_kv_cache(
+                            &key,
+                            &value,
+                            kc,
+                            vc,
+                            self.k_scale.as_ref(),
+                            self.v_scale.as_ref(),
+                            &fm.indices,
+                            &fm.indptr,
+                            &fm.last_len,
+                            fm.batch_indices.as_ref(),
+                            fm.positions.as_ref(),
+                        )?;
+                    }
+
+                    let block_size = if let Some(kc) = key_cache.as_ref() {
+                        kc.dim(1)?
+                    } else {
+                        16
+                    };
+
+                    return if input_metadata.is_prefill {
+                        let plan_info = fm.prefill_plan_info.as_ref().ok_or_else(|| {
+                            candle_core::Error::msg(
+                                "flashinfer prefill requires prefill_plan_info (plan+run path)",
+                            )
+                        })?;
+                        crate::flashinfer::prefill_with_plan(
+                            &query,
+                            key_cache.as_ref().unwrap(),
+                            value_cache.as_ref().unwrap(),
+                            self.k_scale.as_ref(),
+                            self.v_scale.as_ref(),
+                            &fm.indices,
+                            &fm.indptr,
+                            &fm.last_len,
+                            input_metadata.cu_seqlens_q.as_ref().unwrap(),
+                            fm.total_num_rows.unwrap(),
+                            block_size,
+                            attention_heads,
+                            key_value_heads,
+                            head_size,
+                            self.scale as f32,
+                            Some(self.sliding_window.unwrap_or(0) as i32),
+                            Some(softcapping.unwrap_or(0.0f64) as f32),
+                            plan_info,
+                        )
+                    } else {
+                        let plan_info = fm.decode_plan_info.as_ref().ok_or_else(|| {
+                            candle_core::Error::msg(
+                                "flashinfer decode requires decode_plan_info (plan+run path)",
+                            )
+                        })?;
+                        crate::flashinfer::decode_with_plan(
+                            &query,
+                            key_cache.as_ref().unwrap(),
+                            value_cache.as_ref().unwrap(),
+                            self.k_scale.as_ref(),
+                            self.v_scale.as_ref(),
+                            &fm.indices,
+                            &fm.indptr,
+                            &fm.last_len,
+                            block_size,
+                            attention_heads,
+                            key_value_heads,
+                            head_size,
+                            self.scale as f32,
+                            plan_info,
+                            fm.use_cuda_graph,
+                            Some(self.sliding_window.unwrap_or(0) as i32),
+                            Some(softcapping.unwrap_or(0.0f64) as f32),
+                        )
+                    };
                 }
 
-                self.maybe_update_kv_scales(&key, &value)?;
-
-                if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
-                    crate::flashinfer::append_kv_cache(
-                        &key,
-                        &value,
-                        kc,
-                        vc,
-                        self.k_scale.as_ref(),
-                        self.v_scale.as_ref(),
-                        &fm.indices,
-                        &fm.indptr,
-                        &fm.last_len,
-                        fm.batch_indices.as_ref(),
-                        fm.positions.as_ref(),
-                    )?;
-                }
-
-                let block_size = if let Some(kc) = key_cache.as_ref() {
-                    kc.dim(1)?
-                } else {
-                    16
-                };
-
-                return if input_metadata.is_prefill {
-                    let plan_info = fm.prefill_plan_info.as_ref().ok_or_else(|| {
-                        candle_core::Error::msg(
-                            "flashinfer prefill requires prefill_plan_info (plan+run path)",
-                        )
-                    })?;
-                    crate::flashinfer::prefill_with_plan(
-                        &query,
-                        key_cache.as_ref().unwrap(),
-                        value_cache.as_ref().unwrap(),
-                        self.k_scale.as_ref(),
-                        self.v_scale.as_ref(),
-                        &fm.indices,
-                        &fm.indptr,
-                        &fm.last_len,
-                        input_metadata.cu_seqlens_q.as_ref().unwrap(),
-                        fm.total_num_rows.unwrap(),
-                        block_size,
-                        attention_heads,
-                        key_value_heads,
-                        head_size,
-                        self.scale as f32,
-                        Some(self.sliding_window.unwrap_or(0) as i32),
-                        Some(softcapping.unwrap_or(0.0f64) as f32),
-                        plan_info,
-                    )
-                } else {
-                    let plan_info = fm.decode_plan_info.as_ref().ok_or_else(|| {
-                        candle_core::Error::msg(
-                            "flashinfer decode requires decode_plan_info (plan+run path)",
-                        )
-                    })?;
-                    crate::flashinfer::decode_with_plan(
-                        &query,
-                        key_cache.as_ref().unwrap(),
-                        value_cache.as_ref().unwrap(),
-                        self.k_scale.as_ref(),
-                        self.v_scale.as_ref(),
-                        &fm.indices,
-                        &fm.indptr,
-                        &fm.last_len,
-                        block_size,
-                        attention_heads,
-                        key_value_heads,
-                        head_size,
-                        self.scale as f32,
-                        plan_info,
-                        fm.use_cuda_graph,
-                        Some(self.sliding_window.unwrap_or(0) as i32),
-                        Some(softcapping.unwrap_or(0.0f64) as f32),
-                    )
-                };
-            }
-
-            if !flashinfer_group_supported {
-                tracing::warn!(
+                if !flashinfer_group_supported {
+                    tracing::warn!(
                     group_size = group_size,
                     head_size = head_size,
                     is_prefill = input_metadata.is_prefill,
                     "flashinfer disabled for this layer: unsupported gqa/head_dim combination, falling back"
                 );
+                }
             }
-        }
+        } // end if !use_paged_for_large_head (flashinfer)
 
         #[cfg(feature = "flashattn")]
-        if !input_metadata.disable_flash_attn.unwrap_or(false) {
+        if !use_paged_for_large_head && !input_metadata.disable_flash_attn.unwrap_or(false) {
             return self.flash_forward(
                 query,
                 key,

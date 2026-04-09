@@ -54,7 +54,8 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
-#define TOKEN_CHUNK_SIZE 256
+#define TOKEN_CHUNK_SIZE_DEFAULT 256
+#define TOKEN_CHUNK_SIZE_LARGE_HEAD 128
 using namespace vllm;
 
 namespace vllm_rs {
@@ -105,7 +106,7 @@ __device__ inline T make_zero_opt() {
  * @param v_scales      V scale for FP8 quantization (nullptr if not quantized)
  * @param query_start_len  Cumulative sum of query lengths per sequence [num_seqs+1]
  */
-template<typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE>
+template<typename scalar_t, typename cache_t, int HEAD_SIZE, int BLOCK_SIZE, int TOKEN_CHUNK_SIZE>
 __global__ void chunked_prefill_paged_attention_kernel_opt(
     scalar_t* __restrict__ out,              
     const scalar_t* __restrict__ q,          
@@ -397,19 +398,21 @@ __global__ void chunked_prefill_paged_attention_kernel_opt(
 
 // --- Launcher Code ---
 
-#define LAUNCH_PAGED_ATTENTION_PREFILL_OPT(HEAD_SIZE)                                      \
+#define LAUNCH_PAGED_ATTENTION_PREFILL_OPT(HEAD_SIZE, CHUNK_SIZE)                            \
   do {                                                                                     \
+    int num_token_chunks_ = (num_query_tokens + (CHUNK_SIZE) - 1) / (CHUNK_SIZE);          \
+    dim3 grid_(num_queries_per_kv, num_kv_heads, num_token_chunks_);                       \
+    dim3 block_(CHUNK_SIZE);                                                               \
     /* Only request extended shared memory if we need more than 48KB default */            \
     if (smem_size > 48 * 1024) {                                                           \
       cudaFuncSetAttribute(                                                                \
-        vllm_rs::chunked_prefill_paged_attention_kernel_opt<T, cache_T, HEAD_SIZE, BLOCK_SIZE>,\
+        vllm_rs::chunked_prefill_paged_attention_kernel_opt<T, cache_T, HEAD_SIZE, BLOCK_SIZE, CHUNK_SIZE>,\
         cudaFuncAttributeMaxDynamicSharedMemorySize,                                       \
         smem_size);                                                                        \
-      /* Clear any error from unsupported config - kernel will fail properly if needed */  \
       cudaGetLastError();                                                                  \
     }                                                                                      \
-    vllm_rs::chunked_prefill_paged_attention_kernel_opt<T, cache_T, HEAD_SIZE, BLOCK_SIZE> \
-    <<<grid, block, smem_size, stream>>>(                                                  \
+    vllm_rs::chunked_prefill_paged_attention_kernel_opt<T, cache_T, HEAD_SIZE, BLOCK_SIZE, CHUNK_SIZE> \
+    <<<grid_, block_, smem_size, stream>>>(                                                \
       reinterpret_cast<T*>(out),                                                           \
       reinterpret_cast<T*>(query),                                                         \
       reinterpret_cast<cache_T*>(key_cache),                                               \
@@ -468,29 +471,27 @@ void paged_attention_prefill_opt_launcher(
 
   const float* alibi_slopes_ptr = nullptr;
   const int num_queries_per_kv = num_query_heads / num_kv_heads;
-
-  int num_token_chunks = (num_query_tokens + TOKEN_CHUNK_SIZE - 1) / TOKEN_CHUNK_SIZE;
-  dim3 grid(num_queries_per_kv, num_kv_heads, num_token_chunks);
-  dim3 block(TOKEN_CHUNK_SIZE);
   const cudaStream_t stream = (cudaStream_t)stream_;
-  // Shared memory: 32 bytes for SeqInfo + K tile + V tile
   size_t smem_size = 32 + 2 * head_size * BLOCK_SIZE * sizeof(cache_T);
   
   switch (head_size) {
     case 64:
-      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(64);
+      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(64, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
     case 96:
-      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(96);
+      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(96, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
     case 128:
-      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(128);
+      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(128, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
     case 192:
-      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(192);
+      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(192, TOKEN_CHUNK_SIZE_DEFAULT);
       break;
     case 256:
-      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(256);
+      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(256, TOKEN_CHUNK_SIZE_DEFAULT);
+      break;
+    case 512:
+      LAUNCH_PAGED_ATTENTION_PREFILL_OPT(512, TOKEN_CHUNK_SIZE_LARGE_HEAD);
       break;
     default:
       break;
