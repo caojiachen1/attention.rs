@@ -290,6 +290,9 @@ static inline void FillFP8RaggedParams(
         return;                                                \
     }
 
+
+#endif
+
 extern "C" {
 
 void flashinfer_append_kv_cache_fp8(
@@ -313,6 +316,7 @@ void flashinfer_append_kv_cache_fp8(
     int32_t data_type,
     cudaStream_t stream
 ) {
+#if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
     if (data_type != 2 || !k_scale_ptr || !v_scale_ptr) {
         return;
     }
@@ -353,6 +357,7 @@ void flashinfer_append_kv_cache_fp8(
     if (v_fp8_ptr) {
         cudaFreeAsync(v_fp8_ptr, stream);
     }
+#endif
 }
 
 void flashinfer_decode_plan_wrapper_fp8(
@@ -376,6 +381,7 @@ void flashinfer_decode_plan_wrapper_fp8(
     int64_t* plan_info_out,
     cudaStream_t stream
 ) {
+#if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
     if (data_type != 2) {
         return;
     }
@@ -408,6 +414,7 @@ void flashinfer_decode_plan_wrapper_fp8(
         plan_info_out[7] = plan_info.batch_indices_offset;
         plan_info_out[8] = plan_info.same_schedule_for_all_heads;
     }
+#endif
 }
 
 void flashinfer_decode_run_wrapper_fp8(
@@ -434,6 +441,7 @@ void flashinfer_decode_run_wrapper_fp8(
     int32_t out_data_type,
     cudaStream_t stream
 ) {
+#if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
     if (data_type != 2 || !plan_info_vec) {
         return;
     }
@@ -497,6 +505,7 @@ void flashinfer_decode_run_wrapper_fp8(
     if (q_scale_arr) {
         cudaFreeAsync(q_scale_arr, stream);
     }
+#endif
 }
 
 void flashinfer_prefill_wrapper_fp8(
@@ -530,6 +539,7 @@ void flashinfer_prefill_wrapper_fp8(
     int32_t out_data_type,
     cudaStream_t stream
 ) {
+#if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
     if (data_type != 2) {
         return;
     }
@@ -608,6 +618,7 @@ void flashinfer_prefill_wrapper_fp8(
     if (q_scale_arr) {
         cudaFreeAsync(q_scale_arr, stream);
     }
+#endif
 }
 
 void flashinfer_prefill_run_fp8(
@@ -628,6 +639,7 @@ void flashinfer_prefill_run_fp8(
     const int64_t* plan_info_vec,
     cudaStream_t stream
 ) {
+#if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
     if (!k_scale_ptr || !v_scale_ptr) {
         fprintf(stderr, "[flashinfer][prefill_run_fp8] k_scale or v_scale is null\n");
         return;
@@ -721,6 +733,7 @@ void flashinfer_prefill_run_fp8(
     if (q_scale_arr) {
         cudaFreeAsync(q_scale_arr, stream);
     }
+#endif
 }
 
 void flashinfer_prefill_ragged_wrapper_fp8(
@@ -752,6 +765,7 @@ void flashinfer_prefill_ragged_wrapper_fp8(
     int32_t out_data_type,
     cudaStream_t stream
 ) {
+#if defined(USE_FLASHINFER) && defined(FLASHINFER_ENABLE_FP8_E4M3)
     if (data_type != 2 || !k_scale_ptr || !v_scale_ptr) {
         return;
     }
@@ -845,7 +859,7 @@ void flashinfer_prefill_ragged_wrapper_fp8(
     if (k_fp8_ptr) cudaFreeAsync(k_fp8_ptr, stream);
     if (v_fp8_ptr) cudaFreeAsync(v_fp8_ptr, stream);
 #endif
+#endif
 }
 
 }  // extern "C"
-#endif
