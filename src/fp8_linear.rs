@@ -4,56 +4,13 @@ use crate::cuda_utils;
 use crate::kernels::ffi;
 #[cfg(feature = "metal")]
 use crate::metal_kernels;
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+use crate::workspace::get_cutlass_workspace;
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
-use candle_core::cuda_backend::cudarc::driver::CudaSlice;
+use crate::workspace::get_or_init_flashinfer_fp8_workspace;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-#[cfg(feature = "cuda")]
-use candle_core::cuda_backend::WrapErr;
 use candle_core::{DType, Device, Result, Tensor};
-#[cfg(all(feature = "cuda", feature = "flashinfer"))]
-use std::cell::RefCell;
-
-#[cfg(all(feature = "cuda", feature = "flashinfer"))]
-struct FlashInferFp8Workspace {
-    buffer: CudaSlice<u8>,
-    size: usize,
-    device_ordinal: usize,
-}
-
-#[cfg(all(feature = "cuda", feature = "flashinfer"))]
-thread_local! {
-    static FLASHINFER_FP8_WORKSPACE: RefCell<Option<FlashInferFp8Workspace>> = const { RefCell::new(None) };
-}
-
-#[cfg(all(feature = "cuda", feature = "flashinfer"))]
-fn get_or_init_flashinfer_fp8_workspace(
-    dev: &candle_core::cuda_backend::CudaDevice,
-    required_size: usize,
-) -> Result<(*mut std::ffi::c_void, usize)> {
-    FLASHINFER_FP8_WORKSPACE.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let ordinal = dev.ordinal();
-
-        let needs_init = match slot.as_ref() {
-            None => true,
-            Some(existing) => existing.device_ordinal != ordinal || existing.size < required_size,
-        };
-
-        if needs_init {
-            let alloc_size = required_size.max(1);
-            let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
-            *slot = Some(FlashInferFp8Workspace {
-                buffer,
-                size: alloc_size,
-                device_ordinal: ordinal,
-            });
-        }
-
-        let ws = slot.as_ref().unwrap();
-        Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
-    })
-}
 
 #[cfg(feature = "cuda")]
 fn get_cuda_slice<
@@ -538,6 +495,9 @@ pub fn fp8_matmul_cutlass(
         );
     }
 
+    let (gemm_ws_ptr, gemm_ws_bytes) = get_cutlass_workspace(cu_dev, 0)?;
+    let gemm_ws_bytes = gemm_ws_bytes as i64;
+
     match (dev, dtype) {
         (Device::Cuda(_), DType::F16) => {
             let out_ptr = get_cuda_slice::<half::f16>(&output)?;
@@ -555,6 +515,8 @@ pub fn fp8_matmul_cutlass(
                     block_size[0] as i32,
                     block_size[1] as i32,
                     sm_version,
+                    gemm_ws_ptr,
+                    gemm_ws_bytes,
                     stream,
                 )
             }
@@ -575,6 +537,8 @@ pub fn fp8_matmul_cutlass(
                     block_size[0] as i32,
                     block_size[1] as i32,
                     sm_version,
+                    gemm_ws_ptr,
+                    gemm_ws_bytes,
                     stream,
                 )
             }

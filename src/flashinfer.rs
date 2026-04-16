@@ -2,75 +2,16 @@ use crate::cuda_utils;
 use crate::kernels;
 use candle_core as candle;
 use candle_core::backend::BackendStorage;
-use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::cuda_backend::WrapErr;
 use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
-use std::cell::RefCell;
 
-/// Workspace buffer sizes for FlashInfer operations
-pub(crate) const WORKSPACE_FLOAT_SIZE: usize = 384 * 1024 * 1024; // 256 MB
-const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024; // 128 MB
-
-/// Static workspace buffers for FlashInfer to avoid per-call allocation
-struct PinnedHostBuffer {
-    ptr: *mut std::ffi::c_void,
-    size: usize,
-}
-
-impl PinnedHostBuffer {
-    fn new(size: usize) -> Result<Self> {
-        if size == 0 {
-            candle::bail!("Pinned host buffer size must be > 0");
-        }
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            sys::lib()
-                .cuMemAllocHost_v2(&mut ptr, size)
-                .result()
-                .map_err(|e| candle_core::Error::Msg(format!("cuMemAllocHost_v2 failed: {e:?}")))?
-        }
-        if ptr.is_null() {
-            candle::bail!("cuMemAllocHost_v2 returned null pointer");
-        }
-        Ok(Self { ptr, size })
-    }
-
-    fn as_ptr(&self) -> *mut std::ffi::c_void {
-        self.ptr
-    }
-
-    fn size(&self) -> usize {
-        self.size
-    }
-}
-
-impl Drop for PinnedHostBuffer {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                sys::lib()
-                    .cuMemFreeHost(self.ptr)
-                    .result()
-                    .map_err(|e| {
-                        candle_core::Error::Msg(format!("cuMemAllocHost_v2 failed: {e:?}"))
-                    })
-                    .unwrap();
-            }
-        }
-    }
-}
-
-struct FlashInferWorkspace {
-    float_buffer: CudaSlice<u8>,
-    int_buffer: CudaSlice<u8>,
-    pinned_host: PinnedHostBuffer,
-    device_ordinal: usize,
-}
-
-thread_local! {
-    static WORKSPACE: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
-    static WORKSPACE_GRAPH: RefCell<Option<FlashInferWorkspace>> = const { RefCell::new(None) };
-}
+// Re-export workspace functions and constants for backward compatibility with external callers
+#[allow(unused_imports)]
+pub(crate) use crate::workspace::{
+    get_gemm_scratch_workspace, get_or_init_workspace, get_plan_workspace, GEMM_SCRATCH_FLOAT_SIZE,
+    WORKSPACE_FLOAT_SIZE,
+};
 
 fn is_supported_flashinfer_gqa_group_size(group_size: usize) -> bool {
     matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
@@ -176,50 +117,82 @@ fn get_cuda_f32_ptr(t: &Tensor) -> Result<*const f32> {
     }
 }
 
-pub(crate) fn get_or_init_workspace(
-    dev: &candle_core::cuda_backend::CudaDevice,
-    for_cuda_graph: bool,
-) -> Result<(
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    *mut std::ffi::c_void,
-    usize,
-)> {
-    let ws_cell = if for_cuda_graph {
-        &WORKSPACE_GRAPH
-    } else {
-        &WORKSPACE
-    };
-    ws_cell.with(|ws| {
-        let mut ws = ws.borrow_mut();
-        let ordinal = dev.ordinal();
-
-        // Check if we need to (re)initialize the workspace
-        let needs_init = match ws.as_ref() {
-            None => true,
-            Some(existing) => existing.device_ordinal != ordinal,
-        };
-
-        if needs_init {
-            let float_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_FLOAT_SIZE) }.w()?;
-            let int_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_INT_SIZE) }.w()?;
-            let pinned_host = PinnedHostBuffer::new(WORKSPACE_INT_SIZE)?;
-            *ws = Some(FlashInferWorkspace {
-                float_buffer,
-                int_buffer,
-                pinned_host,
-                device_ordinal: ordinal,
-            });
+fn validate_decode_plan_info(plan_info: &[i64], data_type: i32, sm: i32) -> Result<()> {
+    if data_type == 2 && sm == 90 {
+        if plan_info.len() != 9 {
+            candle::bail!(
+                "flashinfer fp8 decode plan_info must have length 9 on sm90, got {}",
+                plan_info.len()
+            );
         }
+    } else if plan_info.len() != 10 {
+        candle::bail!(
+            "flashinfer decode plan_info must have length 10, got {}",
+            plan_info.len()
+        );
+    }
+    Ok(())
+}
 
-        let workspace = ws.as_ref().unwrap();
-        Ok((
-            *workspace.float_buffer.device_ptr() as *mut std::ffi::c_void,
-            *workspace.int_buffer.device_ptr() as *mut std::ffi::c_void,
-            workspace.pinned_host.as_ptr(),
-            workspace.pinned_host.size(),
-        ))
-    })
+fn validate_prefill_plan_info(
+    plan_info: &[i64],
+    float_workspace_size: usize,
+    int_workspace_size: usize,
+) -> Result<()> {
+    if plan_info.is_empty() {
+        candle::bail!("flashinfer prefill plan_info is empty");
+    }
+    let check_offset = |name: &str, offset: i64, limit: usize| -> Result<()> {
+        if offset < 0 || offset as usize >= limit {
+            candle::bail!(
+                "flashinfer prefill plan {} offset {} is out of bounds for workspace size {}",
+                name,
+                offset,
+                limit
+            );
+        }
+        Ok(())
+    };
+    match plan_info[0] {
+        0 => {
+            if plan_info.len() != 16 {
+                candle::bail!(
+                    "flashinfer prefill plan_info must have length 16 for generic plan, got {}",
+                    plan_info.len()
+                );
+            }
+            check_offset("total_num_rows", plan_info[3], int_workspace_size)?;
+            check_offset("request_indices", plan_info[5], int_workspace_size)?;
+            check_offset("qo_tile_indices", plan_info[6], int_workspace_size)?;
+            check_offset("kv_tile_indices", plan_info[7], int_workspace_size)?;
+            check_offset("merge_indptr", plan_info[8], int_workspace_size)?;
+            check_offset("o_indptr", plan_info[9], int_workspace_size)?;
+            check_offset("kv_chunk_size_ptr", plan_info[10], int_workspace_size)?;
+            check_offset("v", plan_info[11], float_workspace_size)?;
+            check_offset("s", plan_info[12], float_workspace_size)?;
+            check_offset("block_valid_mask", plan_info[13], int_workspace_size)?;
+        }
+        1 => {
+            if plan_info.len() != 10 {
+                candle::bail!(
+                    "flashinfer prefill plan_info must have length 10 for SM90 plan, got {}",
+                    plan_info.len()
+                );
+            }
+            check_offset("qo_tile_indices", plan_info[1], int_workspace_size)?;
+            check_offset("qo_indptr", plan_info[2], int_workspace_size)?;
+            check_offset("kv_indptr", plan_info[3], int_workspace_size)?;
+            check_offset("qo_len", plan_info[4], int_workspace_size)?;
+            check_offset("kv_len", plan_info[5], int_workspace_size)?;
+            check_offset("head_indices", plan_info[6], int_workspace_size)?;
+            check_offset("work_indptr", plan_info[7], int_workspace_size)?;
+            check_offset("batch_indices", plan_info[8], int_workspace_size)?;
+        }
+        tag => {
+            candle::bail!("flashinfer prefill plan_info has unsupported tag {}", tag);
+        }
+    }
+    Ok(())
 }
 
 pub fn append_kv_cache(
@@ -517,38 +490,20 @@ impl FlashInferDecodeWithPlan {
             );
         }
 
+        let sm = cuda_utils::sm_version(dev).unwrap_or(0);
         if data_type == 2 {
-            let sm = cuda_utils::sm_version(dev).unwrap_or(0);
             if sm < 90 {
                 candle::bail!("flashinfer fp8 decode requires sm90+, got sm{}", sm);
             }
-            if sm == 90 {
-                if self.plan_info.len() != 9 {
-                    candle::bail!(
-                        "flashinfer fp8 decode plan_info must have length 9 on sm90, got {}",
-                        self.plan_info.len()
-                    );
-                }
-            } else if self.plan_info.len() != 10 {
-                candle::bail!(
-                    "flashinfer fp8 decode plan_info must have length 10 on sm{}, got {}",
-                    sm,
-                    self.plan_info.len()
-                );
-            }
-        } else if self.plan_info.len() != 10 {
-            candle::bail!(
-                "flashinfer decode plan_info must have length 10, got {}",
-                self.plan_info.len()
-            );
         }
+        validate_decode_plan_info(&self.plan_info, data_type, sm)?;
 
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
         let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
-        let (ws_float_ptr, ws_int_ptr, _page_locked_ptr, _page_locked_size) =
-            get_or_init_workspace(dev, self.enable_cuda_graph)?;
+        let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, _, _) =
+            get_plan_workspace(dev, self.enable_cuda_graph)?;
 
         let out_data_type = if q.dtype() == DType::BF16 { 1 } else { 0 };
         let (k_scale_ptr, v_scale_ptr) = if data_type == 2 {
@@ -568,33 +523,61 @@ impl FlashInferDecodeWithPlan {
         };
 
         unsafe {
-            kernels::ffi::flashinfer_decode_run_wrapper(
-                out_ptr,
-                q_ptr,
-                kc_ptr,
-                vc_ptr,
-                *indices_ptr.device_ptr() as *const i32,
-                *indptr_ptr.device_ptr() as *const i32,
-                *last_len_ptr.device_ptr() as *const i32,
-                batch_size as i32,
-                self.num_qo_heads as i32,
-                self.num_kv_heads as i32,
-                self.head_dim as i32,
-                self.block_size as i32,
-                self.sm_scale,
-                k_scale_ptr,
-                v_scale_ptr,
-                ws_float_ptr,
-                WORKSPACE_FLOAT_SIZE,
-                ws_int_ptr,
-                WORKSPACE_INT_SIZE,
-                self.plan_info.as_ptr(),
-                self.window_left,
-                self.logits_soft_cap,
-                data_type,
-                out_data_type,
-                *dev.cu_stream() as i64,
-            );
+            if data_type == 2 && sm == 90 {
+                kernels::ffi::flashinfer_decode_run_wrapper_fp8(
+                    out_ptr,
+                    q_ptr as *mut std::ffi::c_void,
+                    kc_ptr as *mut std::ffi::c_void,
+                    vc_ptr as *mut std::ffi::c_void,
+                    *indices_ptr.device_ptr() as *const i32,
+                    *indptr_ptr.device_ptr() as *const i32,
+                    *last_len_ptr.device_ptr() as *const i32,
+                    batch_size as i32,
+                    self.num_qo_heads as i32,
+                    self.num_kv_heads as i32,
+                    self.head_dim as i32,
+                    self.block_size as i32,
+                    self.sm_scale,
+                    k_scale_ptr,
+                    v_scale_ptr,
+                    ws_float_ptr,
+                    ws_float_size,
+                    ws_int_ptr,
+                    ws_int_size,
+                    self.plan_info.as_ptr(),
+                    data_type,
+                    out_data_type,
+                    *dev.cu_stream() as i64,
+                );
+            } else {
+                kernels::ffi::flashinfer_decode_run_wrapper(
+                    out_ptr,
+                    q_ptr,
+                    kc_ptr,
+                    vc_ptr,
+                    *indices_ptr.device_ptr() as *const i32,
+                    *indptr_ptr.device_ptr() as *const i32,
+                    *last_len_ptr.device_ptr() as *const i32,
+                    batch_size as i32,
+                    self.num_qo_heads as i32,
+                    self.num_kv_heads as i32,
+                    self.head_dim as i32,
+                    self.block_size as i32,
+                    self.sm_scale,
+                    k_scale_ptr,
+                    v_scale_ptr,
+                    ws_float_ptr,
+                    ws_float_size,
+                    ws_int_ptr,
+                    ws_int_size,
+                    self.plan_info.as_ptr(),
+                    self.window_left,
+                    self.logits_soft_cap,
+                    data_type,
+                    out_data_type,
+                    *dev.cu_stream() as i64,
+                );
+            }
         }
 
         let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
@@ -698,10 +681,10 @@ pub fn decode_plan(
         _ => 0,
     };
 
-    let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
-        get_or_init_workspace(dev, enable_cuda_graph)?;
+    let sm = cuda_utils::sm_version(dev).unwrap_or(0);
+    let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
+        get_plan_workspace(dev, enable_cuda_graph)?;
 
-    let mut plan_info = [0i64; 10];
     let last_len_host = last_len_host
         .ok_or_else(|| candle_core::Error::msg("decode_plan requires last_len_host"))?;
     if last_len_host.len() != batch_size {
@@ -728,39 +711,63 @@ pub fn decode_plan(
         candle::bail!("decode_plan requires kv_len_arr_host in metadata");
     };
     let qo_indptr_host = Some(qo_indptr);
+    let mut plan_info = vec![0i64; if data_type == 2 && sm == 90 { 9 } else { 10 }];
     unsafe {
-        kernels::ffi::flashinfer_decode_plan_wrapper(
-            indptr_host.as_ptr().cast(),
-            qo_indptr_host
-                .as_ref()
-                .map(|v| v.as_ptr().cast())
-                .unwrap_or(std::ptr::null()),
-            kv_len_arr_host_slice.as_ptr().cast(),
-            batch_size as i32,
-            num_qo_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            page_size as i32,
-            ws_float_ptr,
-            WORKSPACE_FLOAT_SIZE,
-            ws_int_ptr,
-            WORKSPACE_INT_SIZE,
-            page_locked_ptr,
-            page_locked_size,
-            enable_cuda_graph,
-            data_type,
-            out_data_type,
-            plan_info.as_mut_ptr(),
-            *dev.cu_stream() as i64,
-        );
+        if data_type == 2 && sm == 90 {
+            kernels::ffi::flashinfer_decode_plan_wrapper_fp8(
+                indptr_host.as_ptr() as *mut i32,
+                qo_indptr_host
+                    .as_ref()
+                    .map(|v| v.as_ptr() as *mut i32)
+                    .unwrap_or(std::ptr::null_mut()),
+                kv_len_arr_host_slice.as_ptr() as *mut i32,
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                page_size as i32,
+                ws_float_ptr,
+                ws_float_size,
+                ws_int_ptr,
+                ws_int_size,
+                page_locked_ptr,
+                page_locked_size,
+                enable_cuda_graph,
+                data_type,
+                out_data_type,
+                plan_info.as_mut_ptr(),
+                *dev.cu_stream() as i64,
+            );
+        } else {
+            kernels::ffi::flashinfer_decode_plan_wrapper(
+                indptr_host.as_ptr() as *const i32,
+                qo_indptr_host
+                    .as_ref()
+                    .map(|v| v.as_ptr() as *const i32)
+                    .unwrap_or(std::ptr::null()),
+                kv_len_arr_host_slice.as_ptr() as *const i32,
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                page_size as i32,
+                ws_float_ptr,
+                ws_float_size,
+                ws_int_ptr,
+                ws_int_size,
+                page_locked_ptr,
+                page_locked_size,
+                enable_cuda_graph,
+                data_type,
+                out_data_type,
+                plan_info.as_mut_ptr(),
+                *dev.cu_stream() as i64,
+            );
+        }
     }
 
-    let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-    if data_type == 2 && sm == 90 {
-        Ok(plan_info[..9].to_vec())
-    } else {
-        Ok(plan_info.to_vec())
-    }
+    validate_decode_plan_info(&plan_info, data_type, sm)?;
+    Ok(plan_info)
 }
 
 /// Compute the prefill plan once per model forward. Returns a tagged i64 vector (16 elements).
@@ -781,12 +788,44 @@ pub fn prefill_plan(
     window_left: Option<i32>,
 ) -> Result<Vec<i64>> {
     let dev = dev.as_cuda_device()?;
+    let sm = cuda_utils::sm_version(dev).unwrap_or(0);
     let out_data_type: i32 = if out_dtype == DType::BF16 { 1 } else { 0 };
+    if q_cu_seqlens_host.len() != batch_size + 1 {
+        candle::bail!(
+            "q_cu_seqlens_host length must be batch_size+1 ({}), got {}",
+            batch_size + 1,
+            q_cu_seqlens_host.len()
+        );
+    }
+    if indptr_host.len() != batch_size + 1 {
+        candle::bail!(
+            "indptr_host length must be batch_size+1 ({}), got {}",
+            batch_size + 1,
+            indptr_host.len()
+        );
+    }
+    if kv_len_arr_host.len() != batch_size {
+        candle::bail!(
+            "kv_len_arr_host length must be batch_size ({}), got {}",
+            batch_size,
+            kv_len_arr_host.len()
+        );
+    }
+    let expected_total_num_rows = *q_cu_seqlens_host
+        .last()
+        .ok_or_else(|| candle_core::Error::msg("q_cu_seqlens_host is empty"))?;
+    if expected_total_num_rows != total_num_rows {
+        candle::bail!(
+            "prefill_plan total_num_rows mismatch: q_cu_seqlens_host ends at {}, got {}",
+            expected_total_num_rows,
+            total_num_rows
+        );
+    }
 
-    let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
-        get_or_init_workspace(dev, false)?;
+    let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
+        get_plan_workspace(dev, false)?;
 
-    let mut plan_info = [0i64; 16];
+    let mut plan_info = vec![0i64; if sm == 90 { 10 } else { 16 }];
     unsafe {
         kernels::ffi::flashinfer_prefill_plan_wrapper(
             q_cu_seqlens_host.as_ptr() as *const i32,
@@ -802,16 +841,17 @@ pub fn prefill_plan(
             window_left.unwrap_or(-1),
             out_data_type,
             ws_float_ptr,
-            WORKSPACE_FLOAT_SIZE,
+            ws_float_size,
             ws_int_ptr,
-            WORKSPACE_INT_SIZE,
+            ws_int_size,
             page_locked_ptr,
             page_locked_size,
             plan_info.as_mut_ptr(),
             *dev.cu_stream() as i64,
         );
     }
-    Ok(plan_info.to_vec())
+    validate_prefill_plan_info(&plan_info, ws_float_size, ws_int_size)?;
+    Ok(plan_info)
 }
 
 /// Run prefill using a pre-computed plan (from `prefill_plan`).
@@ -947,10 +987,9 @@ impl FlashInferPrefillWithPlan {
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
 
         let batch_size = self.q_cu_seqlens.dim(0)? - 1;
-        let (ws_float_ptr, _, ws_int_ptr, _) = {
-            let (f, i, pl, pls) = get_or_init_workspace(dev, false)?;
-            (f, WORKSPACE_FLOAT_SIZE, i, WORKSPACE_INT_SIZE)
-        };
+        let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, _, _) =
+            get_plan_workspace(dev, false)?;
+        validate_prefill_plan_info(&self.plan_info, ws_float_size, ws_int_size)?;
 
         let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
 
@@ -988,14 +1027,213 @@ impl FlashInferPrefillWithPlan {
                 k_scale_ptr,
                 v_scale_ptr,
                 ws_float_ptr,
-                WORKSPACE_FLOAT_SIZE,
+                ws_float_size,
                 ws_int_ptr,
-                WORKSPACE_INT_SIZE,
+                ws_int_size,
                 self.window_left,
                 self.logits_soft_cap,
                 data_type,
                 out_data_type,
                 self.plan_info.as_ptr(),
+                *dev.cu_stream() as i64,
+            );
+        }
+
+        let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        Ok((out, q_l.shape().clone()))
+    }
+}
+
+/// FP8 paged prefill using FlashInfer's SM90 FP8 attention kernels.
+/// This is a self-contained operation that does both plan and run internally.
+/// It quantizes Q to FP8 on-the-fly and uses the FP8 KV cache directly.
+/// Requires SM90+ (Hopper or later).
+///
+/// Note: The primary FP8 prefill path now goes through the standard
+/// `prefill_with_plan` which dispatches to `flashinfer_prefill_run_fp8`
+/// in the C++ adapter. This standalone function is kept for direct use.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub fn prefill_fp8_paged(
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    k_scale: Option<&Tensor>,
+    v_scale: Option<&Tensor>,
+    indices: &Tensor,
+    indptr: &Tensor,
+    indptr_host: &[u32],
+    last_len: &Tensor,
+    q_cu_seqlens: &Tensor,
+    q_cu_seqlens_host: &[u32],
+    kv_len_arr_host: &[u32],
+    total_num_rows: u32,
+    block_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+) -> Result<Tensor> {
+    let op = FlashInferFP8PagedPrefill {
+        key_cache: key_cache.clone(),
+        value_cache: value_cache.clone(),
+        k_scale: k_scale.cloned(),
+        v_scale: v_scale.cloned(),
+        indices: indices.clone(),
+        indptr: indptr.clone(),
+        indptr_host: indptr_host.to_vec(),
+        last_len: last_len.clone(),
+        q_cu_seqlens: q_cu_seqlens.clone(),
+        q_cu_seqlens_host: q_cu_seqlens_host.to_vec(),
+        kv_len_arr_host: kv_len_arr_host.to_vec(),
+        total_num_rows,
+        block_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        sm_scale,
+    };
+    q.apply_op1(op)
+}
+
+struct FlashInferFP8PagedPrefill {
+    key_cache: Tensor,
+    value_cache: Tensor,
+    k_scale: Option<Tensor>,
+    v_scale: Option<Tensor>,
+    indices: Tensor,
+    indptr: Tensor,
+    indptr_host: Vec<u32>,
+    last_len: Tensor,
+    q_cu_seqlens: Tensor,
+    q_cu_seqlens_host: Vec<u32>,
+    kv_len_arr_host: Vec<u32>,
+    total_num_rows: u32,
+    block_size: usize,
+    num_qo_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sm_scale: f32,
+}
+
+impl candle::CustomOp1 for FlashInferFP8PagedPrefill {
+    fn name(&self) -> &'static str {
+        "flashinfer-fp8-paged-prefill"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &candle::CpuStorage,
+        _: &Layout,
+    ) -> Result<(candle::CpuStorage, candle::Shape)> {
+        candle::bail!("no cpu support for fp8 paged prefill")
+    }
+
+    fn cuda_fwd(&self, q: &CudaStorage, q_l: &Layout) -> Result<(CudaStorage, candle::Shape)> {
+        match q.dtype() {
+            DType::F16 => self.cuda_fwd_impl::<half::f16>(q, q_l),
+            DType::BF16 => self.cuda_fwd_impl::<half::bf16>(q, q_l),
+            _ => candle::bail!("fp8 paged prefill: unsupported q dtype {:?}", q.dtype()),
+        }
+    }
+}
+
+impl FlashInferFP8PagedPrefill {
+    fn cuda_fwd_impl<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        q: &CudaStorage,
+        q_l: &Layout,
+    ) -> Result<(CudaStorage, candle::Shape)> {
+        let dev = q.device();
+        let sm = cuda_utils::sm_version(dev).unwrap_or(0);
+        if sm < 90 {
+            candle::bail!("flashinfer fp8 paged prefill requires sm90+, got sm{}", sm);
+        }
+
+        let kc_ptr = get_cuda_ptr(&self.key_cache)?;
+        let vc_ptr = get_cuda_ptr(&self.value_cache)?;
+
+        let (indices, indices_l) = self.indices.storage_and_layout();
+        let indices_ptr = match &*indices {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indices_l.start_offset()..),
+            _ => candle::bail!("indices must be cuda"),
+        };
+        let (indptr, indptr_l) = self.indptr.storage_and_layout();
+        let indptr_ptr = match &*indptr {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(indptr_l.start_offset()..),
+            _ => candle::bail!("indptr must be cuda"),
+        };
+        let (last_len, last_len_l) = self.last_len.storage_and_layout();
+        let last_len_ptr = match &*last_len {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(last_len_l.start_offset()..),
+            _ => candle::bail!("last_len must be cuda"),
+        };
+        let (q_lens, q_lens_l) = self.q_cu_seqlens.storage_and_layout();
+        let q_lens_ptr = match &*q_lens {
+            Storage::Cuda(c) => c.as_cuda_slice::<u32>()?.slice(q_lens_l.start_offset()..),
+            _ => candle::bail!("q_cu_seqlens must be cuda"),
+        };
+
+        let k_scale_ptr = self
+            .k_scale
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::msg("fp8 paged prefill requires k_scale"))?;
+        let v_scale_ptr = self
+            .v_scale
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::msg("fp8 paged prefill requires v_scale"))?;
+        let k_scale = get_cuda_f32_ptr(k_scale_ptr)?;
+        let v_scale = get_cuda_f32_ptr(v_scale_ptr)?;
+
+        let out_data_type: i32 = if q.dtype() == DType::BF16 { 1 } else { 0 };
+        let batch_size = self.q_cu_seqlens_host.len().saturating_sub(1);
+
+        let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
+        let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
+        let q_ptr = get_cuda_ptr_storage(q, q_l, q.dtype())?;
+
+        let (
+            ws_float_ptr,
+            ws_float_size,
+            ws_int_ptr,
+            ws_int_size,
+            page_locked_ptr,
+            page_locked_size,
+        ) = get_plan_workspace(dev, false)?;
+
+        unsafe {
+            kernels::ffi::flashinfer_prefill_wrapper_fp8(
+                out_ptr,
+                q_ptr,
+                *q_lens_ptr.device_ptr() as *const i32,
+                self.q_cu_seqlens_host.as_ptr() as *const i32,
+                self.kv_len_arr_host.as_ptr() as *const i32,
+                self.total_num_rows as i32,
+                kc_ptr,
+                vc_ptr,
+                *indices_ptr.device_ptr() as *const i32,
+                *indptr_ptr.device_ptr() as *const i32,
+                self.indptr_host.as_ptr() as *const i32,
+                *last_len_ptr.device_ptr() as *const i32,
+                batch_size as i32,
+                self.num_qo_heads as i32,
+                self.num_kv_heads as i32,
+                self.head_dim as i32,
+                self.block_size as i32,
+                self.sm_scale,
+                k_scale,
+                v_scale,
+                ws_float_ptr,
+                ws_float_size,
+                ws_int_ptr,
+                ws_int_size,
+                page_locked_ptr,
+                page_locked_size,
+                false,
+                2, // data_type = FP8
+                out_data_type,
                 *dev.cu_stream() as i64,
             );
         }
@@ -1123,8 +1361,14 @@ impl FlashInferRaggedPrefill {
 
         let out = unsafe { dev.alloc::<T>(q_l.shape().elem_count()) }.w()?;
         let out_ptr = *out.device_ptr() as *mut std::ffi::c_void;
-        let (ws_float_ptr, ws_int_ptr, page_locked_ptr, page_locked_size) =
-            get_or_init_workspace(dev, false)?;
+        let (
+            ws_float_ptr,
+            ws_float_size,
+            ws_int_ptr,
+            ws_int_size,
+            page_locked_ptr,
+            page_locked_size,
+        ) = get_plan_workspace(dev, false)?;
         unsafe {
             kernels::ffi::flashinfer_prefill_ragged_wrapper(
                 out_ptr,
@@ -1145,9 +1389,9 @@ impl FlashInferRaggedPrefill {
                 k_scale_ptr,
                 v_scale_ptr,
                 ws_float_ptr,
-                WORKSPACE_FLOAT_SIZE,
+                ws_float_size,
                 ws_int_ptr,
-                WORKSPACE_INT_SIZE,
+                ws_int_size,
                 page_locked_ptr,
                 page_locked_size,
                 false,
@@ -1198,4 +1442,29 @@ pub fn prefill_ragged(
         sm_scale,
     };
     q.apply_op1(op)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::workspace::{
+        workspace_regions, GEMM_SCRATCH_FLOAT_SIZE, WORKSPACE_FLOAT_SIZE, WORKSPACE_INT_SIZE,
+    };
+
+    #[test]
+    fn workspace_regions_do_not_overlap_and_fit() {
+        let regions = workspace_regions();
+        assert_eq!(regions.plan_float.offset, 0);
+        assert_eq!(regions.plan_int.offset, 0);
+        assert_eq!(regions.gemm_scratch_float.size, GEMM_SCRATCH_FLOAT_SIZE);
+        assert!(regions.plan_float.size <= WORKSPACE_FLOAT_SIZE);
+        assert!(regions.plan_int.size <= WORKSPACE_INT_SIZE);
+        assert_eq!(
+            regions.plan_float.offset + regions.plan_float.size,
+            regions.gemm_scratch_float.offset
+        );
+        assert!(
+            regions.gemm_scratch_float.offset + regions.gemm_scratch_float.size
+                <= WORKSPACE_FLOAT_SIZE
+        );
+    }
 }
