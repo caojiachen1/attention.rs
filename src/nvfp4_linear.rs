@@ -25,6 +25,21 @@ fn is_hardware_fp4_available(dev: &candle_core::Device) -> bool {
     }
 }
 
+/// Check if FlashInfer-ported FP4 CUTLASS path is available.
+/// Requires SM100+ and the flashinfer feature (which implies cutlass).
+#[cfg(feature = "cuda")]
+fn is_flashinfer_fp4_available(dev: &candle_core::Device) -> bool {
+    if !cfg!(feature = "flashinfer") {
+        return false;
+    }
+    if let Ok(cuda_dev) = dev.as_cuda_device() {
+        let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
+        sm >= 100
+    } else {
+        false
+    }
+}
+
 /// Pad dimension up to the nearest multiple of `align`.
 fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
@@ -57,6 +72,7 @@ pub fn nvfp4_matmul(
     weight_global_scale: f32,
     input_scale: f32,
     bias: Option<&Tensor>,
+    is_prefill: bool,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -118,19 +134,25 @@ pub fn nvfp4_matmul(
                 }
             }
 
-            let use_hardware_fp4 = cfg!(feature = "cutlass")
+            let use_flashinfer_fp4 = cfg!(feature = "flashinfer")
+                && is_flashinfer_fp4_available(dev)
+                && is_prefill
+                && n % 32 == 0
+                && k % 32 == 0;
+
+            let use_hardware_fp4 = !use_flashinfer_fp4
+                && cfg!(feature = "cutlass")
                 && is_hardware_fp4_available(dev)
-                && m >= 32
+                && is_prefill
                 && n % 32 == 0
                 && k % 32 == 0;
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
 
-            if use_hardware_fp4 {
+            if use_flashinfer_fp4 || use_hardware_fp4 {
                 #[cfg(feature = "cutlass")]
                 {
-                    // Hardware FP4 path: quantize activations -> CUTLASS block-scaled GEMM
                     let stream = *cuda_dev.cu_stream() as i64;
 
                     let m_padded = pad_to(m, 128);
@@ -146,8 +168,6 @@ pub fn nvfp4_matmul(
                     let weight_scales_swizzled =
                         Tensor::zeros((n_padded, k_scale_padded), DType::U8, dev)?;
 
-                    // GEMM alpha = input_scale * weight_global_scale
-                    // input_scale_inv is pre-baked into activation block scales during quantization
                     let input_scale_inv = if input_scale != 0.0 {
                         1.0 / input_scale
                     } else {
@@ -233,39 +253,78 @@ pub fn nvfp4_matmul(
                             let (ws_ptr, ws_bytes) = get_cutlass_workspace(cuda_dev, 0)?;
                             let ws_bytes = ws_bytes as i64;
 
-                            match dtype {
-                                DType::F16 => ffi::nvfp4_cutlass_gemm_f16(
-                                    act_packed_ptr as *const std::ffi::c_void,
-                                    weight_ptr,
-                                    act_scales_sw_ptr as *const std::ffi::c_void,
-                                    wscale_sw_ptr as *const std::ffi::c_void,
-                                    alpha_ptr,
-                                    output_ptr,
-                                    m as i32,
-                                    n as i32,
-                                    k as i32,
-                                    ws_ptr,
-                                    ws_bytes,
-                                    stream,
-                                ),
-                                DType::BF16 => ffi::nvfp4_cutlass_gemm_bf16(
-                                    act_packed_ptr as *const std::ffi::c_void,
-                                    weight_ptr,
-                                    act_scales_sw_ptr as *const std::ffi::c_void,
-                                    wscale_sw_ptr as *const std::ffi::c_void,
-                                    alpha_ptr,
-                                    output_ptr,
-                                    m as i32,
-                                    n as i32,
-                                    k as i32,
-                                    ws_ptr,
-                                    ws_bytes,
-                                    stream,
-                                ),
-                                _ => candle_core::bail!(
-                                    "nvfp4_matmul: unsupported dtype {:?}",
-                                    dtype
-                                ),
+                            if use_flashinfer_fp4 {
+                                // FlashInfer-ported CUTLASS path (preferred on SM100+)
+                                match dtype {
+                                    DType::F16 => ffi::flashinfer_nvfp4_cutlass_gemm_f16(
+                                        act_packed_ptr as *const std::ffi::c_void,
+                                        weight_ptr,
+                                        act_scales_sw_ptr as *const std::ffi::c_void,
+                                        wscale_sw_ptr as *const std::ffi::c_void,
+                                        alpha_ptr,
+                                        output_ptr,
+                                        m as i32,
+                                        n as i32,
+                                        k as i32,
+                                        ws_ptr,
+                                        ws_bytes,
+                                        stream,
+                                    ),
+                                    DType::BF16 => ffi::flashinfer_nvfp4_cutlass_gemm_bf16(
+                                        act_packed_ptr as *const std::ffi::c_void,
+                                        weight_ptr,
+                                        act_scales_sw_ptr as *const std::ffi::c_void,
+                                        wscale_sw_ptr as *const std::ffi::c_void,
+                                        alpha_ptr,
+                                        output_ptr,
+                                        m as i32,
+                                        n as i32,
+                                        k as i32,
+                                        ws_ptr,
+                                        ws_bytes,
+                                        stream,
+                                    ),
+                                    _ => candle_core::bail!(
+                                        "nvfp4_matmul: unsupported dtype {:?}",
+                                        dtype
+                                    ),
+                                }
+                            } else {
+                                // Existing CUTLASS path (fallback when flashinfer not enabled)
+                                match dtype {
+                                    DType::F16 => ffi::nvfp4_cutlass_gemm_f16(
+                                        act_packed_ptr as *const std::ffi::c_void,
+                                        weight_ptr,
+                                        act_scales_sw_ptr as *const std::ffi::c_void,
+                                        wscale_sw_ptr as *const std::ffi::c_void,
+                                        alpha_ptr,
+                                        output_ptr,
+                                        m as i32,
+                                        n as i32,
+                                        k as i32,
+                                        ws_ptr,
+                                        ws_bytes,
+                                        stream,
+                                    ),
+                                    DType::BF16 => ffi::nvfp4_cutlass_gemm_bf16(
+                                        act_packed_ptr as *const std::ffi::c_void,
+                                        weight_ptr,
+                                        act_scales_sw_ptr as *const std::ffi::c_void,
+                                        wscale_sw_ptr as *const std::ffi::c_void,
+                                        alpha_ptr,
+                                        output_ptr,
+                                        m as i32,
+                                        n as i32,
+                                        k as i32,
+                                        ws_ptr,
+                                        ws_bytes,
+                                        stream,
+                                    ),
+                                    _ => candle_core::bail!(
+                                        "nvfp4_matmul: unsupported dtype {:?}",
+                                        dtype
+                                    ),
+                                }
                             }
                         }
                     }

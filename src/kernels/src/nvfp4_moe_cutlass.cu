@@ -70,8 +70,11 @@ struct Fp4MoeGemmSm100 {
 
   using ElementType = cutlass::float_e2m1_t;
   using ElementSFType = cutlass::float_ue4m3_t;
-  using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
-  using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+
+  // SM100 requires cute::tuple<Element, SF> for the mainloop builder,
+  // matching the FlashInfer SM100 dense GEMM pattern.
+  using ElementA = cute::tuple<ElementType, ElementSFType>;
+  using ElementB = cute::tuple<ElementType, ElementSFType>;
   using ElementC = OutType;
   using ElementD = OutType;
   using ElementAccumulator = float;
@@ -81,8 +84,8 @@ struct Fp4MoeGemmSm100 {
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD_t = cutlass::layout::RowMajor;
 
-  static constexpr int AlignmentA = 32;
-  static constexpr int AlignmentB = 32;
+  static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementType>::value;
+  static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementType>::value;
   static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
@@ -139,7 +142,8 @@ struct Fp4MoeGemmSm100 {
 
 // SM120 MoE GEMM configuration - using 128x128x128 tile for better compatibility
 // with small problem sizes (MoE often has variable M per expert).
-// The 128x256x256 tile is too large for small M problems.
+// Uses KernelPtrArrayTmaWarpSpecializedPingpong for optimal software pipelining,
+// matching SGLang's implementation.
 template <typename OutType>
 struct Fp4MoeGemmSm120 {
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
@@ -163,19 +167,17 @@ struct Fp4MoeGemmSm120 {
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
   using ArchTag = cutlass::arch::Sm120;
-  using EpilogueOperatorClass = cutlass::arch::OpClassTensorOp;
-  using MainloopOperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
   using ClusterShape = Shape<_1, _1, _1>;
 
-  // Use 128x128x128 tile instead of 128x256x256 for better small-M compatibility
-  // This matches the dense GEMM fallback tile and SM100's tile size
   using MmaTileShape = Shape<_128, _128, _128>;
-  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  // Use explicit PingPong schedule for optimal software pipelining (matches SGLang)
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
   using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, EpilogueOperatorClass, MmaTileShape, ClusterShape,
+      ArchTag, OperatorClass, MmaTileShape, ClusterShape,
       cutlass::epilogue::collective::EpilogueTileAuto,
       ElementAccumulator, ElementAccumulator,
       ElementC, LayoutC*, AlignmentC,
@@ -184,7 +186,7 @@ struct Fp4MoeGemmSm120 {
   >::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, MainloopOperatorClass,
+      ArchTag, OperatorClass,
       ElementA, LayoutA*, AlignmentA,
       ElementB, LayoutB*, AlignmentB,
       ElementAccumulator, MmaTileShape, ClusterShape,
@@ -442,6 +444,11 @@ static int run_fp4_moe_grouped_gemm_sm100(
       epilogue_args,
       hw_info
   };
+  // Use AlongM raster order for better MoE workload performance (matches SGLang)
+  if constexpr (!std::is_const_v<decltype(args.scheduler.raster_order)>) {
+    using RasterOrderOptions = decltype(args.scheduler.raster_order);
+    args.scheduler.raster_order = RasterOrderOptions::AlongM;
+  }
 
   size_t gemm_workspace_size = Gemm::get_workspace_size(args);
   void* gemm_workspace = nullptr;
@@ -631,9 +638,10 @@ static int run_fp4_moe_grouped_gemm_sm120(
   if constexpr (!std::is_const_v<decltype(args.scheduler.max_swizzle_size)>) {
     args.scheduler.max_swizzle_size = 1;
   }
+  // Use AlongM raster order for better MoE workload performance (matches SGLang)
   if constexpr (!std::is_const_v<decltype(args.scheduler.raster_order)>) {
     using Enum_t = decltype(args.scheduler.raster_order);
-    args.scheduler.raster_order = Enum_t::Heuristic;
+    args.scheduler.raster_order = Enum_t::AlongM;
   }
   args.hw_info.cluster_shape = dim3(1, 1, 1);
   args.hw_info.cluster_shape_fallback = dim3(1, 1, 1);

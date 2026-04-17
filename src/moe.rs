@@ -1059,6 +1059,7 @@ pub fn moe_gemm_nvfp4(
     biases: Option<&Tensor>,
     indices: &Tensor,
     pre_sorted: Option<(&Tensor, &Tensor)>,
+    is_prefill: bool,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -1170,9 +1171,10 @@ pub fn moe_gemm_nvfp4(
     let dev = input.device();
     let cuda_dev = dev.as_cuda_device()?;
 
-    // For batched prefill (num_tokens > 32), sort by expert once and dispatch
-    // to hardware FP4 (SM100+) or software WMMA (SM80+).
-    if num_tokens > 32 {
+    // During prefill, sort by expert and dispatch to grouped kernels:
+    // hardware FP4 (SM100+) or software WMMA (SM80+).
+    // Prefill never uses CUDA graphs, so thrust-based expert offset is safe.
+    if is_prefill {
         use crate::sort::ArgSortOp;
 
         let (sorted_expert_ids, sorted_token_ids) = if let Some((stids, seids)) = pre_sorted {
@@ -1192,6 +1194,7 @@ pub fn moe_gemm_nvfp4(
                 } else {
                     input.clone()
                 };
+
                 let output = moe_gemm_nvfp4_hardware(
                     &routed_input,
                     &weights,
@@ -1202,13 +1205,13 @@ pub fn moe_gemm_nvfp4(
                     &sorted_token_ids,
                     &sorted_expert_ids,
                     topk,
-                    true,
+                    is_prefill,
                 )?;
                 return output.reshape((num_tokens, topk, n));
             }
         }
 
-        // WMMA grouped MoE path (SM80+): compute expert offsets on GPU
+        // WMMA grouped MoE path (SM80+): compute expert offsets on GPU.
         let sorted_expert_ids_u32 = sorted_expert_ids.to_dtype(DType::U32)?;
         let sorted_token_ids_u32 = sorted_token_ids.to_dtype(DType::U32)?;
         let expert_counts_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
@@ -1225,7 +1228,7 @@ pub fn moe_gemm_nvfp4(
                     cuda_ptr(&eo_s, DType::U32)? as *mut i32,
                     num_experts as i32,
                     total_slots as i32,
-                    true,
+                    is_prefill,
                     stream,
                 );
             }
@@ -1365,6 +1368,7 @@ pub fn moe_gemm_nvfp4(
     _: Option<&Tensor>,
     _: &Tensor,
     _: Option<(&Tensor, &Tensor)>,
+    _: bool,
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_nvfp4 is not implemented on this platform!")
 }
@@ -1765,17 +1769,17 @@ pub fn moe_gemm_nvfp4_hardware(
 #[allow(clippy::too_many_arguments)]
 /// MXFP4 MoE GEMM.
 ///
-/// Unlike the NVFP4 Blackwell path, the current MXFP4 kernels still consume the
-/// routed expert indices directly and do not need a separate
-/// `sorted_token_ids`/`experts_ids` API for correctness or graph-capture
-/// safety. This wrapper exists so higher-level code can call quantized MoE
-/// helpers from `moe.rs` consistently.
+/// `is_prefill` selects the kernel path: prefill uses the grouped WMMA GEMM
+/// (which internally allocates scratch memory via `cudaMallocAsync` and is
+/// therefore incompatible with CUDA graph capture), while decode uses the
+/// indexed dot-product kernel that is graph-safe.
 pub fn moe_gemm_mxfp4(
     input: &Tensor,
     weights: &Tensor,
     weight_scales: &Tensor,
     biases: Option<&Tensor>,
     indices: &Tensor,
+    is_prefill: bool,
 ) -> Result<Tensor> {
     let input = if input.is_contiguous() {
         input.clone()
@@ -1881,7 +1885,7 @@ pub fn moe_gemm_mxfp4(
             }
 
             let has_bias = biases.is_some();
-            let use_fused = num_tokens >= 32;
+            let use_fused = is_prefill;
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
             {
