@@ -41,6 +41,7 @@ fn is_flashinfer_fp4_available(dev: &candle_core::Device) -> bool {
 }
 
 /// Pad dimension up to the nearest multiple of `align`.
+#[cfg(feature = "cuda")]
 fn pad_to(val: usize, align: usize) -> usize {
     (val + align - 1) / align * align
 }

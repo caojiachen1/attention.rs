@@ -1763,13 +1763,14 @@ pub fn moe_gemm_nvfp4_hardware(
     candle_core::bail!("moe_gemm_nvfp4_hardware is not implemented on this platform!")
 }
 
-#[allow(clippy::too_many_arguments)]
 /// MXFP4 MoE GEMM.
 ///
 /// `is_prefill` selects the kernel path: prefill uses the grouped WMMA GEMM
 /// (which internally allocates scratch memory via `cudaMallocAsync` and is
 /// therefore incompatible with CUDA graph capture), while decode uses the
 /// indexed dot-product kernel that is graph-safe.
+#[allow(clippy::too_many_arguments)]
+#[allow(unused)]
 pub fn moe_gemm_mxfp4(
     input: &Tensor,
     weights: &Tensor,
@@ -1995,117 +1996,119 @@ pub fn moe_gemm_mxfp4(
 
         #[cfg(feature = "metal")]
         candle_core::Device::Metal(metal_dev) => {
-            use candle_core::{DType, Storage};
+            use candle_core::Storage;
 
             let reuse_topk = !input_has_topk_dim && topk <= 8;
             let command_buffer = metal_dev.command_buffer()?;
             let command_buffer_ref = command_buffer.as_ref();
             let output = Tensor::zeros((num_tokens, topk, n), dtype, dev)?;
 
-            let (input_s, input_l) = input.storage_and_layout();
-            let input_ms = match &*input_s {
-                Storage::Metal(s) => s,
-                _ => candle_core::bail!("input must be metal"),
-            };
-            let (weights_s, weights_l) = weights.storage_and_layout();
-            let weights_ms = match &*weights_s {
-                Storage::Metal(s) => s,
-                _ => candle_core::bail!("weights must be metal"),
-            };
-            let (scales_s, scales_l) = weight_scales.storage_and_layout();
-            let scales_ms = match &*scales_s {
-                Storage::Metal(s) => s,
-                _ => candle_core::bail!("weight_scales must be metal"),
-            };
-            let (indices_s, indices_l) = indices.storage_and_layout();
-            let indices_ms = match &*indices_s {
-                Storage::Metal(s) => s,
-                _ => candle_core::bail!("indices must be metal"),
-            };
-            let (output_s, _) = output.storage_and_layout();
-            let output_ms = match &*output_s {
-                Storage::Metal(s) => s,
-                _ => candle_core::bail!("output must be metal"),
-            };
-
-            let x = (
-                input_ms.buffer(),
-                input_l.start_offset() * dtype.size_in_bytes(),
-            );
-            let w = (
-                weights_ms.buffer(),
-                weights_l.start_offset() * weights.dtype().size_in_bytes(),
-            );
-            let sc = (
-                scales_ms.buffer(),
-                scales_l.start_offset() * weight_scales.dtype().size_in_bytes(),
-            );
-            let idx = (
-                indices_ms.buffer(),
-                indices_l.start_offset() * indices.dtype().size_in_bytes(),
-            );
-
-            if let Some(biases) = biases {
-                let biases = if biases.is_contiguous() {
-                    biases.clone()
-                } else {
-                    biases.contiguous()?
-                };
-                let (bias_s, bias_l) = biases.storage_and_layout();
-                let bias_ms = match &*bias_s {
+            {
+                let (input_s, input_l) = input.storage_and_layout();
+                let input_ms = match &*input_s {
                     Storage::Metal(s) => s,
-                    _ => candle_core::bail!("biases must be metal"),
+                    _ => candle_core::bail!("input must be metal"),
                 };
-                let bias_buf = (
-                    bias_ms.buffer(),
-                    bias_l.start_offset() * biases.dtype().size_in_bytes(),
+                let (weights_s, weights_l) = weights.storage_and_layout();
+                let weights_ms = match &*weights_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("weights must be metal"),
+                };
+                let (scales_s, scales_l) = weight_scales.storage_and_layout();
+                let scales_ms = match &*scales_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("weight_scales must be metal"),
+                };
+                let (indices_s, indices_l) = indices.storage_and_layout();
+                let indices_ms = match &*indices_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("indices must be metal"),
+                };
+                let (output_s, _) = output.storage_and_layout();
+                let output_ms = match &*output_s {
+                    Storage::Metal(s) => s,
+                    _ => candle_core::bail!("output must be metal"),
+                };
+
+                let x = (
+                    input_ms.buffer(),
+                    input_l.start_offset() * dtype.size_in_bytes(),
+                );
+                let w = (
+                    weights_ms.buffer(),
+                    weights_l.start_offset() * weights.dtype().size_in_bytes(),
+                );
+                let sc = (
+                    scales_ms.buffer(),
+                    scales_l.start_offset() * weight_scales.dtype().size_in_bytes(),
+                );
+                let idx = (
+                    indices_ms.buffer(),
+                    indices_l.start_offset() * indices.dtype().size_in_bytes(),
                 );
 
-                metal_kernels::call_mxfp4_moe_gemm(
-                    metal_dev.device(),
-                    command_buffer_ref,
-                    metal_kernels::Kernels::default(),
-                    dtype,
-                    x,
-                    w,
-                    sc,
-                    bias_buf,
-                    idx,
-                    output_ms.buffer(),
-                    num_tokens,
-                    topk,
-                    num_experts,
-                    n,
-                    k,
-                    true,
-                    input_has_topk_dim,
-                    reuse_topk,
-                )
-                .map_err(candle_core::Error::wrap)?;
-            } else {
-                let dummy_biases = (input_ms.buffer(), 0usize);
+                if let Some(biases) = biases {
+                    let biases = if biases.is_contiguous() {
+                        biases.clone()
+                    } else {
+                        biases.contiguous()?
+                    };
+                    let (bias_s, bias_l) = biases.storage_and_layout();
+                    let bias_ms = match &*bias_s {
+                        Storage::Metal(s) => s,
+                        _ => candle_core::bail!("biases must be metal"),
+                    };
+                    let bias_buf = (
+                        bias_ms.buffer(),
+                        bias_l.start_offset() * biases.dtype().size_in_bytes(),
+                    );
 
-                metal_kernels::call_mxfp4_moe_gemm(
-                    metal_dev.device(),
-                    command_buffer_ref,
-                    metal_kernels::Kernels::default(),
-                    dtype,
-                    x,
-                    w,
-                    sc,
-                    dummy_biases,
-                    idx,
-                    output_ms.buffer(),
-                    num_tokens,
-                    topk,
-                    num_experts,
-                    n,
-                    k,
-                    false,
-                    input_has_topk_dim,
-                    reuse_topk,
-                )
-                .map_err(candle_core::Error::wrap)?;
+                    metal_kernels::call_mxfp4_moe_gemm(
+                        metal_dev.device(),
+                        command_buffer_ref,
+                        metal_kernels::Kernels::default(),
+                        dtype,
+                        x,
+                        w,
+                        sc,
+                        bias_buf,
+                        idx,
+                        output_ms.buffer(),
+                        num_tokens,
+                        topk,
+                        num_experts,
+                        n,
+                        k,
+                        true,
+                        input_has_topk_dim,
+                        reuse_topk,
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                } else {
+                    let dummy_biases = (input_ms.buffer(), 0usize);
+
+                    metal_kernels::call_mxfp4_moe_gemm(
+                        metal_dev.device(),
+                        command_buffer_ref,
+                        metal_kernels::Kernels::default(),
+                        dtype,
+                        x,
+                        w,
+                        sc,
+                        dummy_biases,
+                        idx,
+                        output_ms.buffer(),
+                        num_tokens,
+                        topk,
+                        num_experts,
+                        n,
+                        k,
+                        false,
+                        input_has_topk_dim,
+                        reuse_topk,
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+                }
             }
 
             Ok(output)

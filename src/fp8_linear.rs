@@ -44,6 +44,7 @@ fn get_cuda_slice<
 /// * `weight_scale_cutlass` - Optional pre-transposed scales for CUTLASS path
 /// * `block_size` - `[block_y, block_x]` quantization block dimensions
 /// * `is_prefill` - true during prefill phase, affects kernel selection
+#[allow(unused)]
 pub fn fp8_matmul(
     input: &Tensor,
     weight: &Tensor,
@@ -57,7 +58,6 @@ pub fn fp8_matmul(
     } else {
         input.contiguous()?
     };
-    let (m, _) = input.dims2()?;
 
     #[cfg(feature = "cuda")]
     let sm_version = if let Ok(cuda_dev) = input.device().as_cuda_device() {
@@ -68,6 +68,7 @@ pub fn fp8_matmul(
 
     #[cfg(all(feature = "cuda", feature = "flashinfer"))]
     {
+        let (m, _) = input.dims2()?;
         // Enable only for decode phase (small M <= 64) on SM90 with BF16 and 128x128 block scales
         let use_flashinfer = !is_prefill
             && m <= 64

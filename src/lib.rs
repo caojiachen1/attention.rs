@@ -16,7 +16,6 @@ pub mod fused_rope;
 pub mod mask;
 #[cfg(feature = "cuda")]
 pub mod sampler;
-#[cfg(feature = "cuda")]
 pub mod sort;
 pub mod topk;
 #[cfg(feature = "cuda")]

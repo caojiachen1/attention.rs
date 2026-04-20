@@ -5,9 +5,11 @@
 use candle_core as candle;
 #[cfg(feature = "metal")]
 use candle_core::backend::BackendStorage;
-use candle_core::{DType, Result, Tensor};
+#[cfg(feature = "cuda")]
+use candle_core::Device;
 #[cfg(any(feature = "cuda", feature = "metal"))]
-use candle_core::{Device, Storage};
+use candle_core::Storage;
+use candle_core::{DType, Result, Tensor};
 #[cfg(feature = "cuda")]
 use half::{bf16, f16};
 #[cfg(feature = "cuda")]
