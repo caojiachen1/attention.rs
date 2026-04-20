@@ -53,6 +53,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_quant.cu");
     println!("cargo:rerun-if-changed=src/gptoss_swiglu.cu");
+    println!("cargo:rerun-if-changed=src/silu_and_mul.cu");
     println!("cargo:rerun-if-changed=src/concat_and_cache_mla_kernel.cu");
     println!("cargo:rerun-if-changed=src/mla_paged_attention.cu");
 
@@ -86,6 +87,10 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_HARDWARE_FP8");
     }
 
+    if compute_cap >= 100 {
+        builder = builder.arg("-DNVFP4_BLACKWELL");
+    }
+
     if marlin_disabled {
         builder = builder.arg("-DNO_MARLIN_KERNEL");
     }
@@ -102,7 +107,9 @@ fn main() -> Result<()> {
             .with_cutlass(Some("da5e086dab31d63815acafdac9a9c5893b1c69e2"));
 
         if compute_cap >= 100 {
-            builder = builder.arg("-DENABLE_FP4");
+            builder = builder
+                .arg("-DENABLE_FP4")
+                .arg("-DCUTLASS_ENABLE_GDC_FOR_SM100");
         }
         if (100..120).contains(&compute_cap) {
             builder = builder.arg("-DENABLE_FP4_SM100");
