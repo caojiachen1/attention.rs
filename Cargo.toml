@@ -39,3 +39,6 @@ metal = ["candle-core/metal", "candle-nn/metal", "dep:metal-kernels", "dep:metal
 cutlass = ["dep:kernels", "kernels/cutlass"]
 flashinfer = ["cuda", "dep:kernels", "kernels/flashinfer"]
 trtllm = ["flashinfer", "kernels/trtllm", "dep:ureq", "dep:sha2"]
+
+[patch."https://github.com/guoqingbao/cudarc"]
+cudarc = { git = "https://github.com/caojiachen1/cudarc" }

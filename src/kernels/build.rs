@@ -67,7 +67,7 @@ fn main() -> Result<()> {
         .source_dir("src")
         .nvcc_thread_patterns(&["flash_api", "cutlass", "flashinfer"], 2)
         .arg("--expt-relaxed-constexpr")
-        .arg("-std=c++17")
+        .arg("-std=c++20")
         .arg("-O3");
 
     if !trtllm_enabled {
@@ -287,10 +287,11 @@ fn main() -> Result<()> {
     // Target handling
     let mut is_target_msvc = false;
     if let Ok(target) = std::env::var("TARGET") {
-        if target.contains("msvc") {
-            is_target_msvc = true;
-            builder = builder.arg("-D_USE_MATH_DEFINES");
-        }
+    if target.contains("msvc") {
+        is_target_msvc = true;
+        builder = builder.arg("-D_USE_MATH_DEFINES");
+        builder = builder.arg("-Xcompiler").arg("/Zc:preprocessor");
+    }
     }
 
     if !is_target_msvc {

@@ -1,8 +1,9 @@
 #[cfg(all(feature = "cuda", feature = "metal"))]
 compile_error!("Enable exactly one backend feature: `cuda` or `metal`, not both.");
 
+// Allow compilation without cuda or metal for CPU fallback
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
-compile_error!("Enable exactly one backend feature: `cuda` or `metal`.");
+compile_error!("Enable one backend feature: `cuda`, `metal`, or use CPU fallback by enabling the `cpu` feature.");
 
 pub mod moe;
 pub mod paged_attention;

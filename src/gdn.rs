@@ -17,7 +17,7 @@ use kernels::ffi;
 #[cfg(feature = "metal")]
 use metal_kernels;
 #[cfg(feature = "cuda")]
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_void, c_long};
 
 #[cfg(feature = "cuda")]
 fn get_cuda_const_ptr(t: &Tensor) -> Result<*const c_void> {
@@ -52,15 +52,17 @@ fn get_cuda_const_ptr_u32(t: &Tensor) -> Result<*const u32> {
 }
 
 #[cfg(feature = "cuda")]
-fn get_cuda_const_ptr_i64(t: &Tensor) -> Result<*const i64> {
+fn get_cuda_const_ptr_c_long(t: &Tensor) -> Result<*const i64> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
     match &*storage {
         Storage::Cuda(s) => {
+            // Get the pointer as *const i64, assuming the tensor data is i64.
+            // This matches the ffi interface which expects *const i64.
             Ok(*s.as_cuda_slice::<i64>()?.slice(offset..).device_ptr() as *const i64)
         }
-        _ => candle_core::bail!("Expected CUDA i64 tensor"),
+        _ => candle_core::bail!("Expected CUDA tensor"),
     }
 }
 
@@ -984,7 +986,7 @@ pub fn causal_conv1d_update_slots(
                 std::ptr::null()
             };
             let state_ptr = get_cuda_mut_ptr(conv_state)?;
-            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let slots_ptr = get_cuda_const_ptr_c_long(slots)?;
             let out_ptr = get_cuda_mut_ptr(&out)?;
             let stream = *dev.cu_stream() as i64;
 
@@ -995,7 +997,7 @@ pub fn causal_conv1d_update_slots(
                         weight_ptr,
                         bias_ptr,
                         state_ptr,
-                        slots_ptr,
+                        slots_ptr as *const i32,
                         out_ptr,
                         batch as c_int,
                         d_conv as c_int,
@@ -1008,7 +1010,7 @@ pub fn causal_conv1d_update_slots(
                         weight_ptr,
                         bias_ptr,
                         state_ptr,
-                        slots_ptr,
+                        slots_ptr as *const i32,
                         out_ptr,
                         batch as c_int,
                         d_conv as c_int,
@@ -1021,7 +1023,7 @@ pub fn causal_conv1d_update_slots(
                         weight_ptr as *const f32,
                         bias_ptr as *const f32,
                         state_ptr as *mut f32,
-                        slots_ptr,
+                        slots_ptr as *const i32,
                         out_ptr as *mut f32,
                         batch as c_int,
                         d_conv as c_int,
@@ -1571,7 +1573,7 @@ pub fn gated_delta_rule_decode_slots(
                 );
             }
 
-            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let slots_ptr = get_cuda_const_ptr_c_long(slots)?;
             let stream = *dev.cu_stream() as i64;
             if q.dtype() == DType::F32 {
                 if state.dtype() != DType::F32 {
@@ -1809,7 +1811,7 @@ pub fn gated_delta_rule_recurrence_varlen(
             let g_ptr = get_cuda_const_ptr(&decay_c)?;
             let beta_ptr = get_cuda_const_ptr(&beta_c)?;
             let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
-            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
+            let slots_ptr = get_cuda_const_ptr_c_long(slots)?;
             let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
             let out_ptr = get_cuda_mut_ptr(&out)?;
             let stream = *dev.cu_stream() as i64;

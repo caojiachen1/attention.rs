@@ -89,7 +89,7 @@ impl candle::InplaceOp2 for KvScaleUpdate {
                 DType::F32 => ffi::update_kv_scales_per_head_f32(
                     src_ptr,
                     dst_ptr,
-                    num_tokens,
+                    num_tokens as i32,
                     num_heads,
                     head_dim,
                     k_scales_ptr,
@@ -99,7 +99,7 @@ impl candle::InplaceOp2 for KvScaleUpdate {
                 DType::F16 => ffi::update_kv_scales_per_head_f16(
                     src_ptr,
                     dst_ptr,
-                    num_tokens,
+                    num_tokens as i32,
                     num_heads,
                     head_dim,
                     k_scales_ptr,
@@ -109,7 +109,7 @@ impl candle::InplaceOp2 for KvScaleUpdate {
                 DType::BF16 => ffi::update_kv_scales_per_head_bf16(
                     src_ptr,
                     dst_ptr,
-                    num_tokens,
+                    num_tokens as i32,
                     num_heads,
                     head_dim,
                     k_scales_ptr,
